@@ -644,7 +644,10 @@ function _compressionAnchorMessageKey(m){
 
 function cmdHelp(){
   const lines=COMMANDS.map(c=>{
-    const usage=c.arg ? (String(c.arg).startsWith('[') ? ` ${c.arg}` : ` <${c.arg}>`) : '';
+    // The table already stores bracketed hints ('<required>' / '[optional]')
+    // after #7675 follow-up #2, so render it verbatim with one leading
+    // space -- adding another pair here produced `<<model_name>>` (#7683).
+    const usage=c.arg ? ` ${normalizeArgHint(c.arg)}` : '';
     return `  /${c.name}${usage} — ${c.desc}`;
   });
   const msg={role:'assistant',content:t('available_commands')+'\n'+lines.join('\n')};

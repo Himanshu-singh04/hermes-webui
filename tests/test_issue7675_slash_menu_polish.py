@@ -196,6 +196,43 @@ def test_hidden_command_path_routes_through_cli_only_response():
     )
 
 
+def test_hidden_command_predicate_is_the_dispatchability_check():
+    """#7683 (review finding 1): the hidden-command predicate must ask the
+    dispatchability question -- "does send() dispatch this command?" -- not
+    "is it absent from _AGENT_COMMANDS_RUN_ON_WEBUI?".
+
+    That set holds only the backend-exec family, so WebUI-native commands
+    (moa/sessions/resume/pet) are intentionally absent from it while still
+    being dispatched by their own native branches further down send().
+    Treating "absent" as "hidden" swallowed /moa before its native handler
+    and answered with the CLI-only explainer instead.
+    """
+    cli_only_idx = MESSAGES_JS.find("if(_agentCmd&&_agentCmd.cli_only){")
+    assert cli_only_idx != -1
+    rest = MESSAGES_JS[cli_only_idx:]
+    hidden_idx = rest.find("_isWebuiDispatchableAgentCommand(_agentCmd)")
+    assert hidden_idx != -1, (
+        "The hidden-command branch must gate on "
+        "_isWebuiDispatchableAgentCommand(_agentCmd) -- the same predicate "
+        "commands.js uses to decide what autocomplete announces -- so a "
+        "WebUI-native command (e.g. /moa) is not misrouted to the CLI-only "
+        "explainer (#7683)."
+    )
+    # And it must not have been "fixed" by adding moa to the generic
+    # backend-exec set, which would send /moa down the generic exec path
+    # instead of its native handler (a different regression).
+    m = re.search(
+        r"const\s+_AGENT_COMMANDS_RUN_ON_WEBUI\s*=\s*new Set\(\[([^\]]+)\]\)",
+        MESSAGES_JS,
+    )
+    assert m, "_AGENT_COMMANDS_RUN_ON_WEBUI not found in messages.js"
+    members = set(re.findall(r"'([^']*)'", m.group(1)))
+    assert "moa" not in members, (
+        "moa must stay out of the generic backend-exec dispatch set -- it "
+        "has its own native handler in send() (#7683)."
+    )
+
+
 # Fix #4: dead code in messages.js removed.
 def test_dead_agent_command_aliases_dict_is_gone():
     """The formerly dead _AGENT_COMMAND_ALIASES dict at the top of

@@ -1778,9 +1778,20 @@ async function send(){
       // Non-dispatchable registry commands (e.g. /agents) must not leak as
       // plain text to the model. Route them through the CLI-only explainer
       // so the boundary is self-explaining (#7675 follow-up #3).
-      if(_agentCmd
-        && _agentCmd.category!=='Plugin'
-        && !_AGENT_COMMANDS_RUN_ON_WEBUI.has(String(_agentCmd.name||'').toLowerCase())){
+      //
+      // The predicate must be the dispatchability check itself, NOT "absent
+      // from _AGENT_COMMANDS_RUN_ON_WEBUI": that set holds only the
+      // backend-exec family, so WebUI-native commands (moa/sessions/
+      // resume/pet) are intentionally absent and would be swallowed here
+      // before their own native handlers below (e.g. /moa at the native
+      // MoA branch). _isWebuiDispatchableAgentCommand() answers the real
+      // question: does send() dispatch this command (backend exec, plugin
+      // transport, or a native branch)? Any remaining command is CLI-only
+      // and gets the explainer (#7683).
+      if(_agentCmd && typeof _isWebuiDispatchableAgentCommand==='function'
+        ? !_isWebuiDispatchableAgentCommand(_agentCmd)
+        : (_agentCmd.category!=='Plugin'
+           && !_AGENT_COMMANDS_RUN_ON_WEBUI.has(String(_agentCmd.name||'').toLowerCase()))){
         if(!S.session){await newSession();await renderSessionList();}
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
         S.messages.push({role:'assistant',content:cliOnlyCommandResponse(_parsedCmd.name,_agentCmd),_ts:Date.now()/1000});
