@@ -176,14 +176,24 @@ def test_hidden_command_path_routes_through_cli_only_response():
     cli_only_idx = MESSAGES_JS.find("if(_agentCmd&&_agentCmd.cli_only){")
     assert cli_only_idx != -1
     rest = MESSAGES_JS[cli_only_idx:]
-    # The hidden-command branch follows the cli_only branch and uses the
-    # same explainer helper.
-    assert "category!=='Plugin'" in rest, (
+    # The hidden-command branch follows the cli_only branch, invokes the
+    # fallback dispatchability helper, and reuses the same explainer.
+    assert "_fallbackNonDispatchableAgentCommandCheck(_agentCmd)" in rest, (
+        "Non-dispatchable registry commands must be routed through the "
+        "explainer via the fallback dispatchability helper (#7683)."
+    )
+    # The Plugin carve-out and the dispatch-allowlist consultation live in
+    # the helper body (the guard's _agentCmd null-check guarantees the
+    # dereferences are safe).
+    helper_idx = MESSAGES_JS.find("function _fallbackNonDispatchableAgentCommandCheck")
+    assert helper_idx != -1
+    helper = MESSAGES_JS[helper_idx : helper_idx + 800]
+    assert "category!=='Plugin'" in helper, (
         "Non-dispatchable registry commands must be routed through the "
         "explainer, except for the Plugin category which has its own "
         "exec transport below."
     )
-    assert "_AGENT_COMMANDS_RUN_ON_WEBUI.has(" in rest, (
+    assert "_AGENT_COMMANDS_RUN_ON_WEBUI.has(" in helper, (
         "Hidden command check must consult the dispatch allowlist to "
         "decide whether to fall through to plain text."
     )
@@ -295,6 +305,7 @@ def _drive_get_matching_commands(*, pet_meta):
         r"\s*(let|var)\s+_agentCommandCache\s*=\s*null\s*;",
         r"\s*(let|var)\s+_agentCommandCachePromise\s*=\s*null\s*;",
         r"\s*(let|var)\s+_agentCommandCacheReady\s*=\s*false\s*;",
+        r"\s*(let|var)\s+_agentCommandCacheAvailable\s*=\s*false\s*;",
         r"\s*(let|var)\s+_agentCommandCachePrimed\s*=\s*false\s*;",
         r"\s*(let|var)\s+_agentCommandCachePrimingPromise\s*=\s*null\s*;",
         r"\s*(let|var)\s+_bundleCommandCache\s*=\s*\[\s*\]\s*;",
@@ -366,6 +377,7 @@ def test_get_matching_commands_builtin_uses_angle_brackets():
         r"\s*(let|var)\s+_agentCommandCache\s*=\s*null\s*;",
         r"\s*(let|var)\s+_agentCommandCachePromise\s*=\s*null\s*;",
         r"\s*(let|var)\s+_agentCommandCacheReady\s*=\s*false\s*;",
+        r"\s*(let|var)\s+_agentCommandCacheAvailable\s*=\s*false\s*;",
         r"\s*(let|var)\s+_agentCommandCachePrimed\s*=\s*false\s*;",
         r"\s*(let|var)\s+_agentCommandCachePrimingPromise\s*=\s*null\s*;",
         r"\s*(let|var)\s+_bundleCommandCache\s*=\s*\[\s*\]\s*;",

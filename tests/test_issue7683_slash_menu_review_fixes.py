@@ -69,11 +69,21 @@ _REGISTRY_PAYLOAD = [
 ]
 
 
-def _run_send(command: str, script_body: str = "") -> dict:
+def _run_send(command: str, script_body: str = "", *, commands_api_error: bool = False, drop_dispatch_helper: bool = False) -> dict:
     """Run the REAL send() from messages.js in a VM with the real COMMANDS
     table, a synthetic /api/commands registry, and instrumented api() that
     records every call path so the test can tell WHICH branch ran.
+
+    ``commands_api_error`` makes the /api/commands registry fetch throw (a
+    transient metadata failure). ``drop_dispatch_helper`` removes the real
+    _isWebuiDispatchableAgentCommand helper from the shared realm so send()
+    exercises the fallback non-dispatchability check.
     """
+    helper_drop_line = (
+        'vm.runInContext("_isWebuiDispatchableAgentCommand = undefined;", ctx);'
+        if drop_dispatch_helper
+        else ""
+    )
     script = textwrap.dedent(
         f"""
         const vm = require('vm');
@@ -131,6 +141,7 @@ def _run_send(command: str, script_body: str = "") -> dict:
           renderSessionListFromCache(){{}},
           api: async (path, options) => {{
             apiCalls.push(path);
+            if (path === '/api/commands' && {json.dumps(commands_api_error)}) throw new Error('registry unavailable');
             if (path === '/api/commands') return {{ commands: {json.dumps(_REGISTRY_PAYLOAD)} }};
             if (path === '/api/commands/moa/resolve') {{
               return {{ usage: '/moa <prompt>', default_preset: 'p', preset: 'p' }};
@@ -147,6 +158,7 @@ def _run_send(command: str, script_body: str = "") -> dict:
         vm.createContext(ctx);
         vm.runInContext({json.dumps(COMMANDS_JS)}, ctx);
         vm.runInContext({json.dumps(MESSAGES_JS)}, ctx);
+        {helper_drop_line}
         (async () => {{
           const result = await vm.runInContext(`(async () => {{
             {script_body}
@@ -226,6 +238,75 @@ def test_hidden_agents_command_still_routes_through_explainer():
     )
     assert "/api/chat/start" not in out["apiCalls"], (
         "/agents must not fall through to the model as plain text."
+    )
+
+
+def test_unknown_command_with_available_metadata_falls_through_to_chat():
+    """#7683 finding A (Greptile P1: \"Unknown commands throw\"): a genuinely
+    unknown slash token, with metadata loaded OK and no match, must keep its
+    intended behaviour -- fall through to the normal agent round-trip
+    (/api/chat/start) -- and must NOT throw on the dispatchability guard (the
+    old ternary-precedence bug dereferenced _agentCmd.category while
+    _agentCmd was null)."""
+    out = _run_send(
+        "/does-not-exist-xyz",
+        """
+        await send();
+        return {};
+        """,
+    )
+    assert "/api/chat/start" in out["apiCalls"], (
+        "a genuinely unknown command must fall through to the normal chat "
+        f"round-trip, got api calls: {out['apiCalls']} (regression on the "
+        "ternary-precedence null dereference, #7683)."
+    )
+
+
+def test_metadata_unavailable_fails_closed_without_chat_round_trip():
+    """#7683 finding B: when the /api/commands registry fetch fails
+    (available:false), a known CLI-only command like /agents must NOT leak to
+    /api/chat/start -- send() fails closed locally with a retryable
+    metadata-unavailable message instead."""
+    out = _run_send(
+        "/agents",
+        """
+        await send();
+        return {};
+        """,
+        commands_api_error=True,
+    )
+    assistant = [m for m in out["messages"] if m["role"] == "assistant"]
+    assert any("temporarily unavailable" in m["content"] for m in assistant), (
+        "a registry failure must fail closed with a retryable unavailable "
+        f"message, got: {assistant!r}"
+    )
+    assert "/api/chat/start" not in out["apiCalls"], (
+        "metadata-unavailable must fail closed -- /api/chat/start must not be "
+        f"called, got api calls: {out['apiCalls']}"
+    )
+
+
+def test_helper_absent_fallback_blocks_non_dispatchable_without_throwing():
+    """#7683 finding C: when the _isWebuiDispatchableAgentCommand helper is
+    absent from the realm, the parenthesised fallback check must still block a
+    non-dispatchable registry command (/agents) through the CLI-only
+    explainer -- without throwing on _agentCmd.category."""
+    out = _run_send(
+        "/agents",
+        """
+        await send();
+        return {};
+        """,
+        drop_dispatch_helper=True,
+    )
+    assistant = [m for m in out["messages"] if m["role"] == "assistant"]
+    assert any("`/agents` is a Hermes CLI-only command" in m["content"] for m in assistant), (
+        "the helper-absent fallback must explain /agents as CLI-only, "
+        f"got: {assistant!r}"
+    )
+    assert "/api/chat/start" not in out["apiCalls"], (
+        "/agents must not fall through to the model as plain text when the "
+        "dispatch helper is absent."
     )
 
 

@@ -473,6 +473,7 @@ function _getSlashSubArgOptions(spec){
 }
 
 let _agentCommandCacheReady=false;
+let _agentCommandCacheAvailable=false;
 async function loadAgentCommandMetadata(force=false){
   if(_agentCommandCacheReady&&!force)return _agentCommandCache||[];
   if(_agentCommandCachePromise&&!force)return _agentCommandCachePromise;
@@ -480,25 +481,36 @@ async function loadAgentCommandMetadata(force=false){
     try{
       const data=await api('/api/commands');
       _agentCommandCache=Array.isArray(data&&data.commands)?data.commands:[];
-    }catch(_){
-      _agentCommandCache=[];
-    }finally{
+      _agentCommandCacheAvailable=true;
       _agentCommandCacheReady=true;
+    }catch(_){
+      // A transient registry failure must NOT be cached as an authoritative
+      // empty registry: leave ready=false so the next call retries, and record
+      // the failure so callers can distinguish an unavailable registry from a
+      // genuine unknown command (#7683).
+      _agentCommandCache=null;
+      _agentCommandCacheAvailable=false;
+      _agentCommandCacheReady=false;
+    }finally{
       _agentCommandCachePromise=null;
     }
-    return _agentCommandCache;
+    return _agentCommandCache||[];
   })();
   return _agentCommandCachePromise;
 }
 
 async function getAgentCommandMetadata(name){
   const needle=String(name||'').trim().toLowerCase();
-  if(!needle) return null;
+  if(!needle) return {available:true,command:null};
   const commands=await loadAgentCommandMetadata();
-  return commands.find(cmd=>{
+  const command=commands.find(cmd=>{
     if(String(cmd&&cmd.name||'').toLowerCase()===needle) return true;
     return Array.isArray(cmd&&cmd.aliases)&&cmd.aliases.some(a=>String(a||'').toLowerCase()===needle);
   })||null;
+  // Preserve metadata availability separately from the lookup result so the
+  // send path can fail closed on a transient registry failure instead of
+  // leaking a known CLI-only command as plain chat text (#7683).
+  return {available:_agentCommandCacheAvailable,command};
 }
 
 function cliOnlyCommandResponse(cmdName, meta){

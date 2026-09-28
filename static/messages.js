@@ -12,6 +12,16 @@ const _AGENT_COMMANDS_RUN_ON_WEBUI = new Set([
   'reload-mcp','reload-skills','codex-runtime','credits',
   'reload_mcp','reload_skills','codex_runtime','credits'
 ]);
+function _fallbackNonDispatchableAgentCommandCheck(_agentCmd){
+  // Degraded-mode fallback used only when the real dispatchability helper
+  // (_isWebuiDispatchableAgentCommand from commands.js) is absent. Mirrors the
+  // former inline predicate: block anything that is neither a Plugin-category
+  // command nor a member of the backend-exec dispatch set. The caller
+  // guarantees _agentCmd is non-null, so the dereferences are safe (#7683).
+  return _agentCmd.category!=='Plugin'
+    && !_AGENT_COMMANDS_RUN_ON_WEBUI.has(String(_agentCmd.name||'').toLowerCase());
+}
+
 function _markSessionViewed(sid, messageCount) {
   if(typeof _setSessionViewedCount!=='function' || !sid) return;
   const next = Number.isFinite(messageCount) ? Number(messageCount) : 0;
@@ -1765,9 +1775,22 @@ async function send(){
         if(typeof renderSessionList==='function') await renderSessionList();
         $('msg').value='';autoResize();hideCmdDropdown();return;
       }
-      const _agentCmd=typeof getAgentCommandMetadata==='function'
+      const _agentCmdMeta=typeof getAgentCommandMetadata==='function'
         ? await getAgentCommandMetadata(_parsedCmd.name)
         : null;
+      const _agentCmd=_agentCmdMeta&&_agentCmdMeta.command||null;
+      // Metadata availability is preserved separately from the lookup result:
+      // when the registry fetch failed (available:false) we cannot tell a
+      // genuinely unknown command from a known CLI-only one, so fail closed
+      // with a retryable message instead of leaking the token to
+      // /api/chat/start (#7683).
+      if(_agentCmdMeta&&_agentCmdMeta.available===false){
+        if(!S.session){await newSession();await renderSessionList();}
+        S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
+        S.messages.push({role:'assistant',content:'Command metadata is temporarily unavailable — please try again.',_ts:Date.now()/1000});
+        renderMessages();
+        $('msg').value='';autoResize();hideCmdDropdown();return;
+      }
       if(_agentCmd&&_agentCmd.cli_only){
         if(!S.session){await newSession(false,{pickerClaimEpoch:_sendProjectPickerClaim});}
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
@@ -1788,10 +1811,11 @@ async function send(){
       // question: does send() dispatch this command (backend exec, plugin
       // transport, or a native branch)? Any remaining command is CLI-only
       // and gets the explainer (#7683).
-      if(_agentCmd && typeof _isWebuiDispatchableAgentCommand==='function'
-        ? !_isWebuiDispatchableAgentCommand(_agentCmd)
-        : (_agentCmd.category!=='Plugin'
-           && !_AGENT_COMMANDS_RUN_ON_WEBUI.has(String(_agentCmd.name||'').toLowerCase()))){
+      if(_agentCmd && (
+        typeof _isWebuiDispatchableAgentCommand==='function'
+          ? !_isWebuiDispatchableAgentCommand(_agentCmd)
+          : _fallbackNonDispatchableAgentCommandCheck(_agentCmd)
+      )){
         if(!S.session){await newSession();await renderSessionList();}
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
         S.messages.push({role:'assistant',content:cliOnlyCommandResponse(_parsedCmd.name,_agentCmd),_ts:Date.now()/1000});
