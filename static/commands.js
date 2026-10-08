@@ -216,8 +216,12 @@ function executeCommand(text){
 function normalizeArgHint(hint){
   const text=String(hint||'').trim();
   if(!text) return undefined;
-  if(/^\[.*\]$/.test(text)) return text;
-  if(/^<.*>$/.test(text)) return text;
+  // A hint that is ALREADY shaped is passed through untouched. The test is on
+  // the FIRST character, not a full-match pair: a mixed hint like
+  // `<file> [options]` starts with `<` but does not end with `>`, and the old
+  // `/^<.*>$/` test let it fall through to the wrap below, producing
+  // `<<file> [options]>` (#7683).
+  if(text.startsWith('<')||text.startsWith('[')) return text;
   return `<${text}>`;
 }
 
@@ -474,6 +478,11 @@ function _getSlashSubArgOptions(spec){
 
 let _agentCommandCacheReady=false;
 let _agentCommandCacheAvailable=false;
+// #7683 [CORE]: the composer fires this on every input event, so a failing
+// /api/commands must not be refetched per keystroke. After a failure the next
+// attempt waits this long. A successful load resets the window.
+const _AGENT_COMMAND_METADATA_RETRY_COOLDOWN_MS=5000;
+let _agentCommandMetadataRetryAt=0;
 async function loadAgentCommandMetadata(force=false){
   if(_agentCommandCacheReady&&!force)return _agentCommandCache||[];
   if(_agentCommandCachePromise&&!force)return _agentCommandCachePromise;
@@ -483,6 +492,9 @@ async function loadAgentCommandMetadata(force=false){
       _agentCommandCache=Array.isArray(data&&data.commands)?data.commands:[];
       _agentCommandCacheAvailable=true;
       _agentCommandCacheReady=true;
+      // A successful load clears the cooldown so the next real need (a force
+      // reload, a profile switch) is not throttled by an earlier failure.
+      _agentCommandMetadataRetryAt=0;
     }catch(_){
       // A transient registry failure must NOT be cached as an authoritative
       // empty registry: leave ready=false so the next call retries, and record
@@ -2633,14 +2645,28 @@ function refreshSlashCommandDropdown(){
 }
 function ensureSkillCommandsLoadedForAutocomplete(){
   if(!_skillCommandCacheReady&&!_skillCommandLoadPromise){
-    loadSkillCommands().then(()=>{refreshSlashCommandDropdown();});
+    loadSkillCommands().then(()=>{
+      if(_skillCommandCacheReady)refreshSlashCommandDropdown();
+    });
   }
   if(!_bundleCommandCacheReady&&!_bundleCommandLoadPromise){
-    loadBundleCommands().then(()=>{refreshSlashCommandDropdown();});
+    loadBundleCommands().then(()=>{
+      if(_bundleCommandCacheReady)refreshSlashCommandDropdown();
+    });
   }
-  // Also preload agent/plugin command metadata for autocomplete
+  // Also preload agent/plugin command metadata for autocomplete.
+  // #7683 [CORE]: refresh ONLY when the metadata actually loaded. A failed
+  // fetch used to refresh anyway, which reopened a dropdown the user had
+  // already dismissed and swallowed the Enter that /new's handler was waiting
+  // for. The call is also rate-limited by a cooldown below, because this runs
+  // on every composer input event — an endpoint that is down would otherwise be
+  // hit once per keystroke (3 fetches vs master's 1 in the reviewer's probe).
   if(!_agentCommandCacheReady&&!_agentCommandCachePromise){
-    loadAgentCommandMetadata().then(()=>{refreshSlashCommandDropdown();});
+    if(_agentCommandMetadataRetryAt>Date.now())return;
+    _agentCommandMetadataRetryAt=Date.now()+_AGENT_COMMAND_METADATA_RETRY_COOLDOWN_MS;
+    loadAgentCommandMetadata().then(()=>{
+      if(_agentCommandCacheAvailable)refreshSlashCommandDropdown();
+    });
   }
 }
 

@@ -1781,16 +1781,14 @@ async function send(){
       const _agentCmd=_agentCmdMeta&&_agentCmdMeta.command||null;
       // Metadata availability is preserved separately from the lookup result:
       // when the registry fetch failed (available:false) we cannot tell a
-      // genuinely unknown command from a known CLI-only one, so fail closed
-      // with a retryable message instead of leaking the token to
-      // /api/chat/start (#7683).
-      if(_agentCmdMeta&&_agentCmdMeta.available===false){
-        if(!S.session){await newSession();await renderSessionList();}
-        S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
-        S.messages.push({role:'assistant',content:'Command metadata is temporarily unavailable — please try again.',_ts:Date.now()/1000});
-        renderMessages();
-        $('msg').value='';autoResize();hideCmdDropdown();return;
-      }
+      // genuinely unknown command from a known CLI-only one, so the
+      // availability flag is carried forward and the fail-closed block runs
+      // AFTER bundle resolution below (#7683) — not here. Running it here
+      // blocked commands that master dispatches without registry metadata:
+      // native /moa, the _AGENT_COMMANDS_RUN_ON_WEBUI backend-exec family and
+      // plugin commands all resolve through their own branches, and a bundle
+      // command may still be waiting.
+      const _registryUnavailable=!!(_agentCmdMeta&&_agentCmdMeta.available===false);
       if(_agentCmd&&_agentCmd.cli_only){
         if(!S.session){await newSession(false,{pickerClaimEpoch:_sendProjectPickerClaim});}
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
@@ -1816,7 +1814,7 @@ async function send(){
           ? !_isWebuiDispatchableAgentCommand(_agentCmd)
           : _fallbackNonDispatchableAgentCommandCheck(_agentCmd)
       )){
-        if(!S.session){await newSession();await renderSessionList();}
+        if(!S.session){await newSession();}
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
         S.messages.push({role:'assistant',content:cliOnlyCommandResponse(_parsedCmd.name,_agentCmd),_ts:Date.now()/1000});
         renderMessages();
@@ -1893,6 +1891,23 @@ async function send(){
           renderMessages();
           $('msg').value='';autoResize();hideCmdDropdown();return;
         }
+      }
+      // #7683 [CORE]: the fail-closed guard runs LAST, after every dispatch
+      // branch above has had its chance. `_agentCmdName` is only meaningful
+      // once those branches have run, and a bundle command that resolved must
+      // not be blocked by a registry that happened to be unavailable — the
+      // bundle metadata does not come from that registry at all.
+      //
+      // `/moa` is exempt because it is a native WebUI branch that never
+      // consults the registry: master reaches its own resolver with
+      // `/api/commands` returning 503, so blocking it here would be a
+      // regression.
+      if(!_bundleCmd&&_registryUnavailable&&_agentCmdName!=='moa'){
+        if(!S.session){await newSession();}
+        S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
+        S.messages.push({role:'assistant',content:'Command metadata is temporarily unavailable — please try again.',_ts:Date.now()/1000});
+        renderMessages();
+        $('msg').value='';autoResize();hideCmdDropdown();return;
       }
     }
   }
