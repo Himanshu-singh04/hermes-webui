@@ -1902,7 +1902,17 @@ async function send(){
       // consults the registry: master reaches its own resolver with
       // `/api/commands` returning 503, so blocking it here would be a
       // regression.
-      if(!_bundleCmd&&_registryUnavailable&&_agentCmdName!=='moa'){
+      //
+      // A plain skill is exempt for the same reason: its metadata comes from
+      // /api/skills, not from the command registry, so a 503 there says
+      // nothing about whether the skill is enabled. Resolve it before the
+      // guard and let a positively matched skill through.
+      const _skillCmd =
+        _registryUnavailable && !_bundleCmd && _agentCmdName !== 'moa'
+        && typeof loadSkillCommands === 'function'
+          ? (await loadSkillCommands()).find(skill => skill.name === _parsedCmd.name)
+          : null;
+      if(!_bundleCmd&&!_skillCmd&&_registryUnavailable&&_agentCmdName!=='moa'){
         if(!S.session){await newSession();}
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
         S.messages.push({role:'assistant',content:'Command metadata is temporarily unavailable — please try again.',_ts:Date.now()/1000});

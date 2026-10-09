@@ -283,7 +283,12 @@ function getMatchingCommands(prefix){
     });
     seen.add(name);
   }
-  if(_agentCommandCacheReady){
+  // #7683 [SILENT]: bundle rows are gated on the BUNDLE cache's readiness,
+  // not the agent registry's. A registry failure leaves
+  // _agentCommandCacheReady=false while _bundleCommandCache is already
+  // populated, and the old gate then hid successfully loaded bundles from
+  // autocomplete (Chromium: /release-bundle present on master, gone here).
+  if(_bundleCommandCacheReady){
     for(const bundle of _bundleCommandCache){
       if(!bundle.name.startsWith(q)||seen.has(bundle.name)||reserved.has(bundle.name))continue;
       matches.push(bundle);

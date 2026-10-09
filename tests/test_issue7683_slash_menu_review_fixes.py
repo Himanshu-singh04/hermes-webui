@@ -676,3 +676,127 @@ def test_mixed_arg_hint_is_not_double_wrapped():
     )
     assert payload["file"] == "<file>"
     assert payload["[options]"] == "[options]"
+
+
+# ── Round-2 finding 1: an enabled plain skill survives a registry outage ────
+
+
+def test_enabled_skill_dispatches_when_registry_is_unavailable():
+    """#7683 round-2 (CORE, static/messages.js:1705): with /api/commands
+    returning 503, selecting an enabled plain skill from autocomplete must
+    still submit /api/chat/start — the skill's metadata comes from
+    /api/skills, so a registry outage says nothing about it. Master submits;
+    the pre-fix head answered "metadata unavailable" and never sent."""
+    out = _run_send(
+        "/deep-research",
+        """
+        // The harness realm has no loadSkillCommands; provide the real
+        // shape (/api/skills list). /deep-research is deliberately absent
+        // from the synthetic registry payload, so only the skill lookup
+        // can identify it.
+        globalThis.loadSkillCommands = async () => [
+          { name: 'deep-research', desc: 'Run a deep research pass' },
+        ];
+        await send();
+        return {};
+        """,
+        commands_api_error=True,
+    )
+    assert "/api/chat/start" in out["apiCalls"], (
+        "an enabled plain skill must still reach /api/chat/start when the "
+        f"command registry is unavailable, got api calls: {out['apiCalls']}"
+    )
+    assistant = [m for m in out["messages"] if m["role"] == "assistant"]
+    assert not any("temporarily unavailable" in m["content"] for m in assistant), (
+        f"the skill must not be answered with metadata-unavailable: {assistant!r}"
+    )
+
+
+def test_unknown_command_still_fails_closed_when_registry_is_unavailable():
+    """#7683 round-2 (control): the skill exemption must not open the leak the
+    guard closes — a command that is NOT a skill must still fail closed with
+    the retryable unavailable message and no chat round trip."""
+    out = _run_send(
+        "/not-a-real-command",
+        """
+        globalThis.loadSkillCommands = async () => [
+          { name: 'deep-research', desc: 'Run a deep research pass' },
+        ];
+        await send();
+        return {};
+        """,
+        commands_api_error=True,
+    )
+    assert "/api/chat/start" not in out["apiCalls"], (
+        "a non-skill command must still fail closed while the registry is "
+        f"unavailable, got api calls: {out['apiCalls']}"
+    )
+    assistant = [m for m in out["messages"] if m["role"] == "assistant"]
+    assert any("temporarily unavailable" in m["content"] for m in assistant), (
+        f"expected the retryable unavailable message, got: {assistant!r}"
+    )
+
+
+# ── Round-2 finding 2: bundle rows gate on the BUNDLE cache's readiness ─────
+
+
+def test_bundle_rows_survive_a_registry_failure():
+    """#7683 round-2 (SILENT, static/commands.js:286): a /api/commands failure
+    leaves _agentCommandCacheReady=false while _bundleCommandCache is already
+    populated. Bundle autocomplete rows must gate on the BUNDLE cache's
+    readiness, or successfully loaded bundles vanish from the dropdown
+    (Chromium: /release-bundle present on master, gone on the old head)."""
+    import re as _re
+
+    # Load the REAL commands.js wholesale (same shared-realm pattern as
+    # _run_send) so every helper getMatchingCommands closes over is present,
+    # then drive only the cache-state flags.
+    script = textwrap.dedent(
+        """
+        const vm = require('vm');
+        const ctx = {
+          console, String, RegExp, Array, Object, Set, Map,
+          window: { addEventListener() {}, requestAnimationFrame(cb) { return 1; } },
+          document: {
+            addEventListener() {},
+            getElementById() { return null; },
+            querySelector() { return null; },
+          },
+          localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+          t: key => key,
+          setTimeout: () => 0, clearTimeout: () => 0,
+          setInterval: () => 0, clearInterval: () => 0,
+        };
+        ctx.globalThis = ctx;
+        ctx.window.window = ctx.window;
+        vm.createContext(ctx);
+        vm.runInContext(COMMANDS_JS, ctx);
+        // Registry failed: agent cache not ready. Bundles loaded fine.
+        vm.runInContext(
+          `_agentCommandCacheReady = false;
+           _bundleCommandCacheReady = true;
+           _bundleCommandCache = [{ name: 'release-bundle', desc: 'Ship it', arg: '' }];
+           _skillCommandCache = [];`,
+          ctx
+        );
+        const out = vm.runInContext(`getMatchingCommands('release')`, ctx);
+        console.log(JSON.stringify(out.map(m => m.name)));
+        """
+    ).replace("COMMANDS_JS", json.dumps(COMMANDS_JS))
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".js", delete=False, encoding="utf-8"
+    ) as fh:
+        fh.write(script)
+        path = Path(fh.name)
+    try:
+        proc = subprocess.run(
+            ["node", str(path)], capture_output=True, text=True, timeout=30
+        )
+        assert proc.returncode == 0, proc.stderr
+        names = json.loads(proc.stdout.strip().splitlines()[-1])
+    finally:
+        path.unlink(missing_ok=True)
+    assert "release-bundle" in names, (
+        "loaded bundles must stay in autocomplete when only the command "
+        f"registry failed, got matches: {names!r}"
+    )
