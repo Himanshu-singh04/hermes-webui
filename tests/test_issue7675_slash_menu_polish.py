@@ -420,3 +420,26 @@ def test_get_matching_commands_builtin_uses_angle_brackets():
         f"Builtin rows still render bare arg hints: {bad!r} "
         f"(regression on #7675 follow-up #2)"
     )
+
+
+def test_run_without_argument_commands_are_not_marked_required():
+    """#7683 review MUST-FIX: ``/skills``, ``/personality`` and ``/reasoning``
+    all run with no argument, so their hints must use the optional form.
+
+    ``/reasoning`` is also shortened to ``[show|hide|<effort>]``: the full
+    effort enumeration is one unbreakable string that clipped at the 390px
+    phone dropdown width (scrollWidth 386 vs clientWidth 366).
+    """
+    assert "arg:'[show|hide|<effort>]'" in COMMANDS_JS
+    assert "arg:'[query]'" in COMMANDS_JS
+    assert "arg:'[name]', subArgs:'personalities'" in COMMANDS_JS
+
+    # Pin the length, not just the literal: the fix exists because the
+    # enumerated hint overflowed the phone dropdown, so a future edit must
+    # not re-grow it past what fits.
+    match = re.search(r"\{name:'reasoning'[^}]*?arg:'([^']+)'", COMMANDS_JS)
+    assert match, "/reasoning registry entry not found"
+    assert len(match.group(1)) <= 24, (
+        f"/reasoning hint {match.group(1)!r} is too long to fit the 390px "
+        f"dropdown (the enumerated 44-char form clipped at ...xhigh|ma)"
+    )

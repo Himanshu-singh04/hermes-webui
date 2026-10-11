@@ -108,10 +108,22 @@ def test_frontend_can_execute_agent_commands_via_api_endpoint():
     assert COMMANDS_JS.count("api('/api/commands/exec'") == 1
 
 
-def test_cli_only_response_mentions_webui_and_cli_scope():
+def test_cli_only_response_mentions_webui_scope():
     assert "function cliOnlyCommandResponse" in COMMANDS_JS
-    assert "Hermes CLI-only command" in COMMANDS_JS
-    assert "cannot run inside the WebUI" in COMMANDS_JS
+    # #7683 review: "isn't available in the WebUI" replaced the longer
+    # "is a Hermes CLI-only command and cannot run inside the WebUI".
+    assert "isn't available in the WebUI" in COMMANDS_JS
+    assert "cannot run inside the WebUI" not in COMMANDS_JS
+
+
+def test_prompt_style_cli_only_response_points_at_a_bare_prompt():
+    """Prompt-style registry commands (/plan, /review, /learn) tell the user to
+    send the text without the slash, since that asks the agent directly."""
+    assert "const PROMPT_STYLE_CLI_ONLY_COMMANDS=new Set(['plan','review','learn']);" in COMMANDS_JS
+    response_idx = COMMANDS_JS.find("function cliOnlyCommandResponse")
+    response = COMMANDS_JS[response_idx : response_idx + 1200]
+    assert "PROMPT_STYLE_CLI_ONLY_COMMANDS.has(name)" in response
+    assert "Send it without the slash to ask the agent directly." in response
 
 
 def test_browser_cli_only_response_explains_server_side_browser_tools():
@@ -348,7 +360,7 @@ def test_cli_only_response_helper_uses_canonical_command_name():
         """
     )
 
-    assert "`/browser` is a Hermes CLI-only command" in result["response"]
+    assert "`/browser` isn't available in the WebUI" in result["response"]
     assert "Attach browser tools" in result["response"]
     assert "configured server-side" in result["response"]
 

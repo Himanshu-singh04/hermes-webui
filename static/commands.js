@@ -22,8 +22,8 @@ const COMMANDS=[
   {name:'new',       desc:t('cmd_new'),            fn:cmdNew,       noEcho:true},
   {name:'usage',     desc:t('cmd_usage'),   fn:cmdUsage,     noEcho:true},
   {name:'theme',     desc:t('cmd_theme'), fn:cmdTheme, arg:'<name>',  noEcho:true},
-  {name:'personality', desc:t('cmd_personality'), fn:cmdPersonality, arg:'<name>', subArgs:'personalities'},
-  {name:'skills',    desc:t('cmd_skills'),   fn:cmdSkills,   arg:'<query>'},
+  {name:'personality', desc:t('cmd_personality'), fn:cmdPersonality, arg:'[name]', subArgs:'personalities'},
+  {name:'skills',    desc:t('cmd_skills'),   fn:cmdSkills,   arg:'[query]'},
   {name:'use',       desc:t('cmd_use'),      fn:cmdUse,      arg:'<skill-name>', subArgs:'skills', noEcho:true},
   {name:'stop',      desc:t('cmd_stop'),     fn:cmdStop,      noEcho:true},
   {name:'goal',      desc:t('cmd_goal'),     fn:cmdGoal,      arg:'[status|pause|resume|clear|text]', subArgs:['status','pause','resume','clear']},
@@ -37,7 +37,7 @@ const COMMANDS=[
   {name:'background',desc:t('cmd_background'),fn:cmdBackground,arg:'<prompt>',  noEcho:true},
   {name:'status',    desc:t('cmd_status'),   fn:cmdStatus},
   {name:'voice',     desc:t('cmd_voice'),    fn:cmdVoice,     noEcho:true},
-  {name:'reasoning', desc:t('cmd_reasoning'), fn:cmdReasoning, arg:'<show|hide|none|minimal|low|medium|high|xhigh|max>', subArgs:['show','hide','none','minimal','low','medium','high','xhigh','max'], noEcho:true},
+  {name:'reasoning', desc:t('cmd_reasoning'), fn:cmdReasoning, arg:'[show|hide|<effort>]', subArgs:['show','hide','none','minimal','low','medium','high','xhigh','max'], noEcho:true},
   {name:'yolo', desc:t('cmd_yolo'), fn:cmdYolo, noEcho:true},
   {name:'branch', desc:t('cmd_branch'), fn:cmdBranch, arg:'[name]', noEcho:true},
 ];
@@ -530,15 +530,24 @@ async function getAgentCommandMetadata(name){
   return {available:_agentCommandCacheAvailable,command};
 }
 
+// Registry commands whose CLI behaviour is "hand the agent this prompt". Typing
+// the same text without the slash asks the agent directly in the WebUI, so the
+// explainer points at that instead of leaving the user at a dead end (#7683
+// review). Extend the set when another prompt-style command joins the registry.
+const PROMPT_STYLE_CLI_ONLY_COMMANDS=new Set(['plan','review','learn']);
+
 function cliOnlyCommandResponse(cmdName, meta){
   const name=String((meta&&meta.name)||cmdName||'').trim();
   const desc=String((meta&&meta.description)||'').trim();
   const detail=desc?`\n\n${desc}`:'';
   let extra='';
+  if(PROMPT_STYLE_CLI_ONLY_COMMANDS.has(name)){
+    extra='\n\nSend it without the slash to ask the agent directly.';
+  }
   if(name==='browser'){
     extra='\n\nBrowser tools in WebUI must be configured server-side with the agent/browser environment. Once configured, ask the model to use browser tools directly; `/browser` itself only works in `hermes chat`.';
   }
-  return `\`/${name}\` is a Hermes CLI-only command and cannot run inside the WebUI.${detail}${extra}`;
+  return `\`/${name}\` isn't available in the WebUI.${detail}${extra}`;
 }
 
 async function executeAgentCommand(text,_meta){
