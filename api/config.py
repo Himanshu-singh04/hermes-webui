@@ -6990,7 +6990,14 @@ def set_auxiliary_model(task: str, provider: str, model: str, advanced: dict | N
                         _custom_provider_slug_key(provider),
                     )
                     if _cp_match is not None:
-                        resolved_base_url = str(_cp_match.get("base_url") or "").strip() or None
+                        # Judge emptiness on the EXPANDED value (as master did on
+                        # its expanded read) but write the RAW text, so a
+                        # ``${VAR}`` that expands to "" doesn't replace the
+                        # slot's working URL with an empty reference.
+                        _raw_url = str(_cp_match.get("base_url") or "").strip()
+                        resolved_base_url = (
+                            _raw_url if str(_expand_env_vars(_raw_url) or "").strip() else None
+                        )
                 if not resolved_base_url:
                     # Best-effort fallback for the unnamed `custom` case (no own
                     # entry). Keep it non-fatal for unexpected errors, but let a

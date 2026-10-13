@@ -910,3 +910,52 @@ def test_synthetic_secret_never_reaches_disk_through_any_converted_writer(
     assert _raw(cfg_path)["skills"]["disabled"] == ["some-skill", "demo"]
     check("POST /api/skills/toggle enable", _toggle("demo", True))
     assert _raw(cfg_path)["skills"]["disabled"] == ["some-skill"]
+
+
+def test_named_custom_auxiliary_endpoint_that_expands_empty_keeps_the_slot_url(cfg_path, monkeypatch):
+    """Codex r3 on #8129: selecting a named custom provider whose base_url is a
+    ${VAR} set to "" must not replace the slot's working URL with that empty
+    reference. Master judged the EXPANDED value (empty -> no URL from the
+    entry); the raw write must make the same decision."""
+    monkeypatch.setenv("HERMES_TEST_EMPTY", "")
+
+    def mutate(raw):
+        raw["custom_providers"].append({"name": "Empty Endpoint", "base_url": EMPTY_REF})
+        raw["auxiliary"] = {
+            "vision": {
+                "provider": "openai",
+                "model": "gpt-4o",
+                "base_url": "https://working.example.test/v1",
+            }
+        }
+
+    _seed(cfg_path, mutate)
+    handler = _post(
+        "/api/model/set",
+        {"scope": "auxiliary", "task": "vision", "provider": "custom:empty-endpoint", "model": "synthetic-model"},
+    )
+    assert handler.status == 200, handler.json_body()
+    slot = _raw(cfg_path)["auxiliary"]["vision"]
+    assert slot["provider"] == "custom:empty-endpoint"
+    assert slot.get("base_url") == "https://working.example.test/v1", slot
+    assert _raw(cfg_path)["custom_providers"][-1]["base_url"] == EMPTY_REF
+    _assert_refs_survive(cfg_path, "POST /api/model/set auxiliary (empty named endpoint)")
+
+
+def test_named_custom_auxiliary_endpoint_reference_is_not_expanded(cfg_path, monkeypatch):
+    """The auxiliary writer reads the selected custom_providers entry from the
+    raw document, so a ${VAR} endpoint is written as that reference."""
+    monkeypatch.setenv("HERMES_TEST_NAMED_URL", "https://llm.example.test/v1?key=" + SECRET)
+    _seed(
+        cfg_path,
+        lambda raw: raw["custom_providers"].append(
+            {"name": "Secret Endpoint", "base_url": "${HERMES_TEST_NAMED_URL}"}
+        ),
+    )
+    handler = _post(
+        "/api/model/set",
+        {"scope": "auxiliary", "task": "vision", "provider": "custom:secret-endpoint", "model": "synthetic-model"},
+    )
+    assert handler.status == 200, handler.json_body()
+    assert _raw(cfg_path)["auxiliary"]["vision"]["base_url"] == "${HERMES_TEST_NAMED_URL}"
+    _assert_refs_survive(cfg_path, "POST /api/model/set auxiliary (named ${VAR} endpoint)")
