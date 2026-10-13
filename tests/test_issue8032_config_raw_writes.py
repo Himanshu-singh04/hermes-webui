@@ -632,12 +632,20 @@ def test_unchanged_empty_env_ref_survives_auxiliary_advanced_save(cfg_path, monk
 
     def mutate(raw):
         raw["auxiliary"] = {
-            "vision": {"provider": "openai", "model": "gpt-4o", "base_url": EMPTY_REF, "timeout": 30}
+            "vision": {
+                "provider": "openai",
+                "model": "gpt-4o",
+                "base_url": EMPTY_REF,
+                "timeout": 30,
+                # Greptile P2 on #8129: an optional extra_body field.
+                "extra_body": {"optional": EMPTY_REF, "fixed": 1},
+            }
         }
 
     _seed(cfg_path, mutate)
     row = _aux_row("vision")
     assert row["base_url"] == ""
+    assert row["extra_body"] == {"optional": "", "fixed": 1}
     handler = _post(
         "/api/model/set",
         {
@@ -652,8 +660,49 @@ def test_unchanged_empty_env_ref_survives_auxiliary_advanced_save(cfg_path, monk
 
     slot = _raw(cfg_path)["auxiliary"]["vision"]
     assert slot.get("base_url") == EMPTY_REF, "the unchanged empty ${VAR} base_url was dropped"
+    assert slot.get("extra_body") == {"optional": EMPTY_REF, "fixed": 1}, "the empty ${VAR} in extra_body was dropped"
     assert slot["timeout"] == 30
     _assert_refs_survive(cfg_path, "POST /api/model/set auxiliary advanced (empty ref)")
+
+
+def test_auxiliary_save_keeps_env_backed_provider_and_model(cfg_path, monkeypatch):
+    """Greptile P2 on #8129: the advanced dialog re-posts the slot's displayed
+    (resolved, stripped) provider/model; the references must stay."""
+    monkeypatch.setenv("HERMES_TEST_AUX_PROVIDER", "openai")
+    monkeypatch.setenv("HERMES_TEST_AUX_MODEL", " gpt-4o-mini ")
+
+    def mutate(raw):
+        raw["auxiliary"] = {
+            "vision": {"provider": "${HERMES_TEST_AUX_PROVIDER}", "model": "${HERMES_TEST_AUX_MODEL}"}
+        }
+
+    _seed(cfg_path, mutate)
+    row = _aux_row("vision")
+    assert (row["provider"], row["model"]) == ("openai", "gpt-4o-mini")
+    handler = _post(
+        "/api/model/set",
+        {
+            "scope": "auxiliary",
+            "task": "vision",
+            "provider": row["provider"],
+            "model": row["model"],
+            "advanced": _advanced_as_displayed(row, main=False),
+        },
+    )
+    assert handler.status == 200, handler.json_body()
+    slot = _raw(cfg_path)["auxiliary"]["vision"]
+    assert slot["provider"] == "${HERMES_TEST_AUX_PROVIDER}"
+    assert slot["model"] == "${HERMES_TEST_AUX_MODEL}"
+
+    # A model the user really picked is written as given.
+    config_handler = _post(
+        "/api/model/set",
+        {"scope": "auxiliary", "task": "vision", "provider": "openai", "model": "gpt-4o"},
+    )
+    assert config_handler.status == 200, config_handler.json_body()
+    slot = _raw(cfg_path)["auxiliary"]["vision"]
+    assert slot["provider"] == "${HERMES_TEST_AUX_PROVIDER}"
+    assert slot["model"] == "gpt-4o"
 
 
 def test_unchanged_empty_env_ref_survives_main_advanced_save(cfg_path, monkeypatch):

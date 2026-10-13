@@ -6929,8 +6929,10 @@ def set_auxiliary_model(task: str, provider: str, model: str, advanced: dict | N
             slot_cfg = aux_cfg.get(task, {})
             if not isinstance(slot_cfg, dict):
                 slot_cfg = {}
-            slot_cfg["provider"] = provider
-            slot_cfg["model"] = model
+            # Keep a ${VAR} that already resolves to the submitted value: the
+            # advanced dialog re-posts the provider/model it displayed (#8032).
+            slot_cfg["provider"] = _preserve_env_ref(slot_cfg.get("provider"), provider, normalize=str.strip)
+            slot_cfg["model"] = _preserve_env_ref(slot_cfg.get("model"), model, normalize=str.strip)
             if provider and (provider.startswith("custom:") or provider == "custom"):
                 # Resolve the auxiliary slot's base_url against the SELECTED
                 # provider, not the active main provider. A bare
