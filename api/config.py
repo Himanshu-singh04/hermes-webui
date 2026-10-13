@@ -981,9 +981,9 @@ def _config_for_yaml_save(config_data: dict) -> dict:
 # expanded dict writes the resolved secret in place of its ``${VAR}``
 # reference. ``${env:VAR}`` and every other reference form must likewise be
 # saved verbatim. A writer that must COMPARE a stored value against a
-# resolved one expands a copy for the comparison and keeps the raw value.
-# _save_yaml_config_file() additionally restores unchanged references as a
-# defense in depth (see _restore_env_ref_templates).
+# resolved one expands a copy for the comparison and keeps the raw value; a
+# writer that re-saves a field the UI displayed resolved goes through
+# _preserve_env_ref().
 _ENV_REF_PATTERN = re.compile(r"\$\{[^}]+\}")
 
 
@@ -999,12 +999,12 @@ def _preserve_env_ref(raw_value, new_value, normalize=None):
     Lets a writer re-save a value the UI displayed from an env-backed field
     without baking the resolved value into config.yaml, while a value the user
     really changed is still written exactly as given (#8032).
+
+    This includes an EMPTY submission: a reference whose variable is set to ""
+    is displayed as "" and re-submitted as "", which is an unchanged field, so
+    the reference is kept rather than dropped.
     """
     if not _has_env_ref(raw_value) or not isinstance(new_value, str) or new_value == raw_value:
-        return new_value
-    if new_value == "":
-        # An explicit clear is always the user's intent, even when the
-        # reference currently expands to "" (unset variable).
         return new_value
     try:
         expanded = _expand_env_vars(raw_value)
@@ -1022,212 +1022,16 @@ def _normalize_base_url_for_compare(value) -> str:
     return str(value or "").strip().rstrip("/")
 
 
-def _items_by_resolved_name(items) -> dict | None:
-    """Index a list of mappings by their env-resolved ``name`` when every item
-    has a unique string name; ``None`` otherwise (fall back to positions)."""
-    if not isinstance(items, list):
-        return None
-    indexed: dict = {}
-    for item in items:
-        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
-            return None
-        try:
-            key = _expand_env_vars(item["name"])
-        except Exception:
-            return None
-        if key in indexed:
-            return None
-        indexed[key] = item
-    return indexed
-
-
-def _selected_endpoint_source(raw_cfg, provider_id):
-    """Return the RAW ``base_url`` of the config record *provider_id* routes
-    through, or ``None`` when no single record is identifiable.
-
-    ``custom:<slug>`` is the unique ``custom_providers`` entry (matched on its
-    env-resolved name), a ``providers.<id>`` key is that entry, and the unnamed
-    ``custom`` provider is the main ``model`` block. Only this record may supply
-    a ``${VAR}`` template for a derived endpoint (#8032): a global search for
-    any template with an equal expansion could bind the destination to an
-    unrelated variable.
-    """
-    pid = str(provider_id or "").strip()
-    if not isinstance(raw_cfg, dict) or not pid:
-        return None
-    if pid.startswith("custom:"):
-        entries = raw_cfg.get("custom_providers")
-        if not isinstance(entries, list):
-            return None
-        resolved = [
-            {**e, "name": _expand_env_vars(e.get("name"))} if isinstance(e, dict) else e
-            for e in entries
-        ]
-        try:
-            match = _unique_custom_provider_entry(resolved, _custom_provider_slug_key(pid))
-        except AmbiguousCustomProviderError:
-            return None
-        return match.get("base_url") if isinstance(match, dict) else None
-    if pid == "custom":
-        model_block = raw_cfg.get("model")
-        return model_block.get("base_url") if isinstance(model_block, dict) else None
-    providers = raw_cfg.get("providers")
-    if isinstance(providers, dict) and isinstance(providers.get(pid), dict):
-        return providers[pid].get("base_url")
-    return None
-
-
-def _endpoint_for_save(source_raw, resolved_url, current_raw):
-    """Value to persist for a derived ``base_url``: the selected record's own
-    ``${VAR}`` template when it resolves to *resolved_url*, the record's literal
-    when the record is literal, else the destination field's own reference when
-    that still resolves to the URL, else the URL as given."""
-    normalize = _normalize_base_url_for_compare
-    if isinstance(source_raw, str) and source_raw.strip():
-        if _has_env_ref(source_raw):
-            kept = _preserve_env_ref(source_raw, resolved_url, normalize=normalize)
-            if kept == source_raw:
-                return source_raw
-        else:
-            try:
-                if normalize(source_raw) == normalize(resolved_url):
-                    return resolved_url
-            except Exception:
-                pass
-    return _preserve_env_ref(current_raw, resolved_url, normalize=normalize)
-
-
-def _restore_env_ref_templates(new, raw, _memo=None):
-    """Restore raw ``${VAR}`` templates wherever *new* still holds exactly
-    their current expansion, so persisting a loaded (expanded) structure never
-    writes the plaintext value back. Values the caller changed, added or
-    removed are kept as given. Mirrors hermes-agent's
-    ``_preserve_env_ref_templates`` (#8032, #8115).
-
-    Cycle-safe: output containers are registered per ``(new, raw)`` pair before
-    descending, so a recursive YAML alias anywhere in the document terminates.
-    """
-    if isinstance(new, str):
-        return _preserve_env_ref(raw, new)
-    if isinstance(new, dict):
-        if not isinstance(raw, dict):
-            return new
-    elif isinstance(new, list):
-        if not isinstance(raw, list):
-            return new
-    else:
-        return new
-    if _memo is None:
-        _memo = {}
-    key = (id(new), id(raw))
-    if key in _memo:
-        return _memo[key]
-    if isinstance(new, dict):
-        out: dict = {}
-        _memo[key] = out
-        for k, value in new.items():
-            out[k] = _restore_env_ref_templates(value, raw[k], _memo) if k in raw else value
-        return out
-    out_list: list = []
-    _memo[key] = out_list
-    raw_by_name = _items_by_resolved_name(raw)
-    if raw_by_name is not None and _items_by_resolved_name(new) is not None:
-        # Named entries (custom_providers, ...) match by name, so a reordered
-        # or shortened list keeps each entry's own templates.
-        out_list.extend(
-            _restore_env_ref_templates(item, raw_by_name.get(item["name"]), _memo) for item in new
-        )
-        return out_list
-    out_list.extend(_restore_list_items(new, raw, _memo))
-    return out_list
-
-
-def _restore_list_items(new: list, raw: list, memo: dict) -> list:
-    """List half of :func:`_restore_env_ref_templates`.
-
-    Each on-disk template occurrence is restored at most once, and an on-disk
-    literal is never replaced by a template:
-    1. a template the caller passed verbatim consumes its own occurrence;
-    2. at the same index, an unused template whose expansion equals the value
-       is restored, and an equal on-disk literal is kept;
-    3. a value equal to a remaining on-disk literal is kept;
-    4. otherwise the first unused template with an equal expansion is restored
-       (a reordered list, e.g. MCP args).
-    Containers recurse positionally only when the lengths match.
-    """
-    same_len = len(new) == len(raw)
-    slots = []  # [index, template, expansion, used]
-    for idx, item in enumerate(raw):
-        if isinstance(item, str) and _has_env_ref(item):
-            try:
-                slots.append([idx, item, _expand_env_vars(item), False])
-            except Exception:
-                continue
-    literals = collections.Counter(
-        item for item in raw if isinstance(item, str) and not _has_env_ref(item)
-    )
-    out = list(new)
-    pending = []
-    for i, item in enumerate(new):
-        if isinstance(item, (dict, list)):
-            out[i] = _restore_env_ref_templates(item, raw[i], memo) if same_len else item
-        elif isinstance(item, str):
-            if _has_env_ref(item):
-                for slot in slots:
-                    if not slot[3] and slot[1] == item:
-                        slot[3] = True
-                        break
-            else:
-                pending.append(i)
-    unresolved = []
-    for i in pending:
-        item = out[i]
-        if same_len:
-            slot = next((sl for sl in slots if sl[0] == i and not sl[3] and sl[2] == item), None)
-            if slot is not None:
-                slot[3] = True
-                out[i] = slot[1]
-                continue
-            if raw[i] == item and literals[item] > 0:
-                literals[item] -= 1
-                continue
-        unresolved.append(i)
-    floating = []
-    for i in unresolved:
-        if literals[out[i]] > 0:
-            literals[out[i]] -= 1
-        else:
-            floating.append(i)
-    for i in floating:
-        slot = next((sl for sl in slots if not sl[3] and sl[2] == out[i]), None)
-        if slot is not None:
-            slot[3] = True
-            out[i] = slot[1]
-    return out
-
-
 def _save_yaml_config_file(config_path: Path, config_data: dict) -> None:
     try:
         from api import yaml_compat as _yaml
     except ImportError as exc:
         raise RuntimeError("PyYAML is required to write Hermes config.yaml") from exc
 
-    data = _config_for_yaml_save(config_data)
-    # Defense in depth for the write rule above (#8032): if a caller hands us
-    # an env-expanded structure, put back every ``${VAR}`` reference whose
-    # current expansion is the value about to be written. Writers should
-    # already pass the raw document; this only catches regressions/new paths.
-    try:
-        on_disk = _load_yaml_config_file_raw(config_path)
-    except Exception:
-        on_disk = {}
-    if on_disk:
-        data = _restore_env_ref_templates(data, on_disk)
-
     config_path.parent.mkdir(parents=True, exist_ok=True)
     _paths._atomic_write_text(
         config_path,
-        _yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
+        _yaml.safe_dump(_config_for_yaml_save(config_data), sort_keys=False, allow_unicode=True),
         encoding="utf-8",
     )
     # Invalidate the memoized parse for this path so the next read re-parses the
@@ -6799,12 +6603,15 @@ def _apply_advanced_model_options(model_cfg: dict, advanced: dict | None) -> Non
         raise ValueError("advanced model options must be an object")
     if "base_url" in advanced:
         base_url = str(advanced.get("base_url") or "").strip().rstrip("/")
-        if base_url:
-            # model_cfg is the RAW block: re-submitting the displayed (resolved)
-            # URL keeps a ${VAR} reference instead of baking it (#8032).
-            model_cfg["base_url"] = _preserve_env_ref(
-                model_cfg.get("base_url"), base_url, normalize=_normalize_base_url_for_compare
-            )
+        # model_cfg is the RAW block: re-submitting the displayed (resolved)
+        # URL keeps a ${VAR} reference instead of baking it (#8032). That
+        # includes "" for a reference whose variable is empty: the field is
+        # unchanged, so the reference survives instead of being removed.
+        stored_base_url = _preserve_env_ref(
+            model_cfg.get("base_url"), base_url, normalize=_normalize_base_url_for_compare
+        )
+        if stored_base_url:
+            model_cfg["base_url"] = stored_base_url
         else:
             model_cfg.pop("base_url", None)
     for field in ("timeout", "download_timeout", "max_concurrency"):
@@ -6825,10 +6632,13 @@ def _apply_advanced_model_options(model_cfg: dict, advanced: dict | None) -> Non
         if extra_body in (None, ""):
             model_cfg.pop("extra_body", None)
         elif isinstance(extra_body, dict):
-            if extra_body:
-                model_cfg["extra_body"] = extra_body
-            else:
+            if not extra_body:
                 model_cfg.pop("extra_body", None)
+            elif _expand_env_vars(model_cfg.get("extra_body")) != extra_body:
+                # Only a changed object is written: re-submitting the displayed
+                # (resolved) one unchanged keeps the raw block and its ${VAR}
+                # references (#8032).
+                model_cfg["extra_body"] = extra_body
         else:
             raise ValueError("extra_body must be a JSON object")
     if "service_tier" in advanced:
@@ -6907,11 +6717,12 @@ def set_hermes_default_model(model_id: str, provider: str | None = None, advance
             )
 
         if resolved_base_url and not provider_override_won:
-            _new_base_url = str(resolved_base_url).strip().rstrip("/")
-            model_cfg["base_url"] = _endpoint_for_save(
-                _selected_endpoint_source(config_data, resolved_provider),
-                _new_base_url,
+            # Same value as master writes; only a ${VAR} already in model.base_url
+            # that resolves to it is kept instead of its expansion (#8032).
+            model_cfg["base_url"] = _preserve_env_ref(
                 raw_model_cfg.get("base_url"),
+                str(resolved_base_url).strip().rstrip("/"),
+                normalize=_normalize_base_url_for_compare,
             )
         elif persisted_provider != previous_provider:
             if persisted_provider == "openai":
@@ -7189,11 +7000,12 @@ def set_auxiliary_model(task: str, provider: str, model: str, advanced: dict | N
                     except Exception:
                         resolved_base_url = None
                 if resolved_base_url:
-                    _slot_url = str(resolved_base_url).strip().rstrip("/")
-                    slot_cfg["base_url"] = _endpoint_for_save(
-                        _selected_endpoint_source(config_data, provider),
-                        _slot_url,
+                    # A ${VAR} already in the slot's base_url that resolves to
+                    # the new URL is kept instead of its expansion (#8032).
+                    slot_cfg["base_url"] = _preserve_env_ref(
                         slot_cfg.get("base_url"),
+                        str(resolved_base_url).strip().rstrip("/"),
+                        normalize=_normalize_base_url_for_compare,
                     )
             if advanced is not None:
                 try:

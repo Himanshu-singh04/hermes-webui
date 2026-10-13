@@ -198,59 +198,6 @@ def _reader_disabled() -> set:
     return routes._get_disabled_skill_names_for_profile()
 
 
-# ── The shared save helper (#8032 minimal repro) ───────────────────────────────
-
-
-def test_expanded_load_then_save_keeps_references(cfg_path):
-    from api import config
-
-    data = config._load_yaml_config_file(cfg_path)
-    assert data["providers"]["openai"]["api_key"] == SECRET  # reads expand
-    data["display"]["show_reasoning"] = True
-    config._save_yaml_config_file(cfg_path, data)
-
-    _assert_refs_survive(cfg_path, "_save_yaml_config_file(expanded)")
-    assert _raw(cfg_path)["display"]["show_reasoning"] is True
-
-
-def test_save_helper_writes_an_intentionally_changed_value(cfg_path):
-    from api import config
-
-    data = config._load_yaml_config_file(cfg_path)
-    data["providers"]["openai"]["api_key"] = "sk-user-typed-new-value"
-    del data["custom_providers"][0]["api_key"]
-    config._save_yaml_config_file(cfg_path, data)
-
-    raw = _raw(cfg_path)
-    assert raw["providers"]["openai"]["api_key"] == "sk-user-typed-new-value"
-    assert "api_key" not in raw["custom_providers"][0]
-    _assert_refs_survive(
-        cfg_path,
-        "_save_yaml_config_file(edit)",
-        skip=("providers.openai.api_key", "custom_providers[0].api_key"),
-    )
-
-
-def test_save_helper_restores_refs_in_shortened_and_reordered_lists(cfg_path):
-    from api import config
-
-    raw = _raw(cfg_path)
-    raw["custom_providers"].insert(0, {"name": "first", "api_key": "${HERMES_TEST_TOKEN}"})
-    cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-
-    data = config._load_yaml_config_file(cfg_path)
-    data["mcp_servers"]["local"]["args"] = data["mcp_servers"]["local"]["args"][1:]
-    data["custom_providers"].reverse()
-    config._save_yaml_config_file(cfg_path, data)
-
-    _assert_no_secret(cfg_path, "_save_yaml_config_file(shifted lists)")
-    raw = _raw(cfg_path)
-    assert raw["mcp_servers"]["local"]["args"] == ["${HERMES_TEST_TOKEN}"]
-    assert [cp["name"] for cp in raw["custom_providers"]] == ["synthetic", "first"]
-    assert raw["custom_providers"][0]["api_key"] == REF
-    assert raw["custom_providers"][1]["api_key"] == "${HERMES_TEST_TOKEN}"
-
-
 # ── api/config.py writers via their HTTP routes ────────────────────────────────
 
 
@@ -577,7 +524,17 @@ def test_skill_toggle_preserves_nested_env_refs_in_platform_list(cfg_path, skill
     _assert_refs_survive(cfg_path, "skills toggle (platform list)")
 
 
-# ── Gate findings on #8129 (adversarial Codex, 2026-10-10) ─────────────
+# ── Raw write snapshots (#8129 gate findings) ──────────────────────────────────
+
+
+def _seed(cfg_path, mutate):
+    from api import config as _config
+
+    raw = _raw(cfg_path)
+    mutate(raw)
+    cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    _reset_config_caches()
+    _config.reload_config()
 
 
 def test_raw_write_does_not_propagate_through_a_shared_yaml_anchor(cfg_path):
@@ -603,238 +560,9 @@ def test_raw_write_does_not_propagate_through_a_shared_yaml_anchor(cfg_path):
     _assert_refs_survive(cfg_path, "set_auxiliary_model (shared anchor)")
 
 
-def test_explicit_clear_survives_when_the_reference_expands_to_empty(cfg_path, monkeypatch):
-    """Clearing a field whose ${VAR} currently expands to "" must clear it, not
-    put the reference back."""
-    from api import config, dashboard_probe
-
-    assert config._preserve_env_ref("${HERMES_TEST_EMPTY_URL}", "") == ""
-    monkeypatch.setenv("HERMES_TEST_EMPTY_URL", "")
-    raw = _raw(cfg_path)
-    raw["webui"]["dashboard"]["url"] = "${HERMES_TEST_EMPTY_URL}"
-    cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-    _reset_config_caches()
-
-    dashboard_probe.save_dashboard_config({"enabled": "auto", "url": ""})
-    assert "url" not in _raw(cfg_path)["webui"]["dashboard"]
-    _assert_refs_survive(cfg_path, "save_dashboard_config (clear empty-expanding ref)")
-
-
-CP_URL_REF = "${HERMES_TEST_CP_URL}"
-CP_URL = "https://llm.example.test/v1?key=" + SECRET
-
-
-def test_named_custom_provider_url_is_written_as_its_template(cfg_path, monkeypatch):
-    """Selecting a named custom provider whose base_url is an env reference to a
-    secret-bearing URL must write that ${VAR} template into model.base_url,
-    never the expanded URL (gate repro: POST /api/default-model)."""
-    monkeypatch.setenv("HERMES_TEST_CP_URL", CP_URL)
-    raw = _raw(cfg_path)
-    raw["custom_providers"][0]["base_url"] = CP_URL_REF
-    cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-    _reset_config_caches()
-    # The provider resolver reads the in-memory config, so reload it from the
-    # file (as the server does on its next stat check).
-    from api import config as _config
-
-    _config.reload_config()
-
-    handler = _post(
-        "/api/default-model",
-        {"model": "@custom:synthetic:synthetic-model", "provider": "custom:synthetic"},
-    )
-    assert handler.status == 200, handler.json_body()
-    raw = _raw(cfg_path)
-    assert raw["model"].get("base_url") in (None, CP_URL_REF)
-    assert raw["custom_providers"][0]["base_url"] == CP_URL_REF
-    _assert_no_secret(cfg_path, "POST /api/default-model (named custom provider url)")
-
-
-def test_unnamed_custom_auxiliary_url_is_written_as_its_template(cfg_path, monkeypatch):
-    """An unnamed ``custom`` auxiliary slot derives its URL from the main model
-    block; an env reference to a secret-bearing URL there must not be expanded
-    into the slot (gate repro: POST /api/model/set auxiliary)."""
-    monkeypatch.setenv("HERMES_TEST_CP_URL", CP_URL)
-    raw = _raw(cfg_path)
-    raw["model"]["provider"] = "custom"
-    raw["model"]["base_url"] = CP_URL_REF
-    raw["custom_providers"] = []
-    raw.pop("auxiliary", None)
-    cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-    _reset_config_caches()
-    # The provider resolver reads the in-memory config, so reload it from the
-    # file (as the server does on its next stat check).
-    from api import config as _config
-
-    _config.reload_config()
-
-    handler = _post(
-        "/api/model/set",
-        {"scope": "auxiliary", "task": "vision", "provider": "custom", "model": "synthetic-model"},
-    )
-    assert handler.status == 200, handler.json_body()
-    raw = _raw(cfg_path)
-    assert raw["auxiliary"]["vision"].get("base_url") in (None, CP_URL_REF)
-    _assert_no_secret(cfg_path, "POST /api/model/set (unnamed custom auxiliary url)")
-
-
-TOKEN_REF = "${HERMES_TEST_TOKEN}"
-
-
-def test_reordered_same_length_scalar_list_keeps_its_template(cfg_path):
-    """Same-length scalar lists match by value, not position: moving an
-    env-backed arg must not bake the token (senior gate repro)."""
-    from api import config
-
-    out = config._restore_env_ref_templates({"args": [TOKEN, "--token"]}, {"args": ["--token", TOKEN_REF]})
-    assert out == {"args": [TOKEN_REF, "--token"]}
-    out3 = config._restore_env_ref_templates(
-        {"args": ["--a", "--b", TOKEN]}, {"args": ["--a", TOKEN_REF, "--b"]}
-    )
-    assert out3 == {"args": ["--a", "--b", TOKEN_REF]}
-    # A literal the user typed on disk is never swapped for a template.
-    assert config._restore_env_ref_templates(
-        {"args": ["plain-value", "--token"]}, {"args": ["--token", "plain-value"]}
-    ) == {"args": ["plain-value", "--token"]}
-
-
-def test_mcp_update_reordering_an_env_backed_arg_keeps_the_reference(cfg_path):
-    """Through the real MCP update handler: reordering args that contain the
-    expanded token keeps ``${HERMES_TEST_TOKEN}`` on disk."""
-    import api.routes as routes
-
-    raw = _raw(cfg_path)
-    raw.setdefault("mcp_servers", {})["reorder"] = {"command": "synthetic-mcp", "args": ["--token", TOKEN_REF]}
-    cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-    _reset_config_caches()
-
-    handler = _FakeHandler()
-    routes._handle_mcp_server_update(handler, "reorder", {"command": "synthetic-mcp", "args": [TOKEN, "--token"]})
-    assert handler.status == 200, handler.json_body()
-    assert _raw(cfg_path)["mcp_servers"]["reorder"]["args"] == [TOKEN_REF, "--token"]
-    _assert_no_secret(cfg_path, "MCP update (reordered args)")
-
-
-# ── Gate round 2 findings on #8129 (adversarial Codex) ─────────────────
-
-SAME_URL = "https://same.example.test/v1"
-
-
-def _seed(cfg_path, mutate):
-    from api import config as _config
-
-    raw = _raw(cfg_path)
-    mutate(raw)
-    cfg_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-    _reset_config_caches()
-    _config.reload_config()
-
-
-def test_main_url_comes_from_the_selected_provider_not_an_equal_template(cfg_path, monkeypatch):
-    monkeypatch.setenv("HERMES_TEST_URL_A", SAME_URL)
-    monkeypatch.setenv("HERMES_TEST_URL_B", SAME_URL)
-
-    def mutate(raw):
-        raw["custom_providers"] = [
-            {"name": "first", "base_url": "${HERMES_TEST_URL_A}"},
-            {"name": "second", "base_url": "${HERMES_TEST_URL_B}"},
-        ]
-
-    _seed(cfg_path, mutate)
-    handler = _post("/api/default-model", {"model": "@custom:second:synthetic-model", "provider": "custom:second"})
-    assert handler.status == 200, handler.json_body()
-    assert _raw(cfg_path)["model"].get("base_url") in (None, "${HERMES_TEST_URL_B}")
-
-
-def test_unnamed_aux_url_comes_from_the_main_block_not_an_equal_template(cfg_path, monkeypatch):
-    monkeypatch.setenv("HERMES_TEST_URL_A", SAME_URL)
-    monkeypatch.setenv("HERMES_TEST_URL_B", SAME_URL)
-
-    def mutate(raw):
-        raw["model"] = {"default": "synthetic-model", "provider": "custom", "base_url": "${HERMES_TEST_URL_B}"}
-        raw["custom_providers"] = [{"name": "unrelated", "base_url": "${HERMES_TEST_URL_A}"}]
-        raw.pop("auxiliary", None)
-
-    _seed(cfg_path, mutate)
-    handler = _post(
-        "/api/model/set",
-        {"scope": "auxiliary", "task": "compression", "provider": "custom", "model": "synthetic-model"},
-    )
-    assert handler.status == 200, handler.json_body()
-    assert _raw(cfg_path)["auxiliary"]["compression"].get("base_url") in (None, "${HERMES_TEST_URL_B}")
-
-
-def test_literal_selected_endpoint_stays_literal(cfg_path, monkeypatch):
-    monkeypatch.setenv("HERMES_TEST_URL_A", SAME_URL)
-
-    def mutate(raw):
-        raw["custom_providers"] = [
-            {"name": "unrelated", "base_url": "${HERMES_TEST_URL_A}"},
-            {"name": "literal", "base_url": SAME_URL},
-        ]
-
-    _seed(cfg_path, mutate)
-    handler = _post(
-        "/api/model/set",
-        {"scope": "auxiliary", "task": "vision", "provider": "custom:literal", "model": "synthetic-model"},
-    )
-    assert handler.status == 200, handler.json_body()
-    assert _raw(cfg_path)["auxiliary"]["vision"].get("base_url") in (None, SAME_URL)
-
-
-def test_keyed_provider_url_is_written_as_its_template(cfg_path, monkeypatch):
-    """Selecting an env-backed ``providers.<id>.base_url`` (pre-existing gap)
-    writes the template, never the expanded URL."""
-    monkeypatch.setenv("HERMES_TEST_CP_URL", CP_URL)
-
-    def mutate(raw):
-        raw["providers"] = {"synthetic": {"base_url": CP_URL_REF, "models": ["synthetic-model"]}}
-
-    _seed(cfg_path, mutate)
-    handler = _post("/api/default-model", {"model": "synthetic-model", "provider": "synthetic"})
-    assert handler.status == 200, handler.json_body()
-    assert _raw(cfg_path)["model"].get("base_url") in (None, CP_URL_REF)
-    _assert_no_secret(cfg_path, "POST /api/default-model (providers.<id> url)")
-
-
-def test_list_restore_keeps_literals_and_uses_each_template_once(cfg_path):
-    from api import config
-
-    # A literal equal to the token's expansion and the reference trade places.
-    assert config._restore_env_ref_templates(
-        {"args": [TOKEN, TOKEN_REF, "--tail"]}, {"args": [TOKEN_REF, TOKEN, "--tail"]}
-    ) == {"args": [TOKEN, TOKEN_REF, "--tail"]}
-    # An unchanged, fully expanded save keeps the on-disk order and kinds.
-    assert config._restore_env_ref_templates(
-        {"args": [TOKEN, TOKEN]}, {"args": [TOKEN_REF, TOKEN]}
-    ) == {"args": [TOKEN_REF, TOKEN]}
-    # One template occurrence is never restored twice.
-    assert config._restore_env_ref_templates({"args": [TOKEN, TOKEN]}, {"args": [TOKEN_REF]}) == {
-        "args": [TOKEN_REF, TOKEN]
-    }
-
-
-def test_mcp_update_literal_and_reference_trade_places(cfg_path):
-    import api.routes as routes
-
-    def mutate(raw):
-        raw.setdefault("mcp_servers", {})["reorder"] = {
-            "command": "synthetic-mcp",
-            "args": [TOKEN_REF, TOKEN, "--tail"],
-        }
-
-    _seed(cfg_path, mutate)
-    handler = _FakeHandler()
-    routes._handle_mcp_server_update(
-        handler, "reorder", {"command": "synthetic-mcp", "args": [TOKEN, TOKEN_REF, "--tail"]}
-    )
-    assert handler.status == 200, handler.json_body()
-    assert _raw(cfg_path)["mcp_servers"]["reorder"]["args"] == [TOKEN, TOKEN_REF, "--tail"]
-
-
-def test_recursive_yaml_elsewhere_does_not_break_a_save(cfg_path):
-    """An unrelated recursive alias must not make the restore guard recurse
-    forever (base returned 200)."""
+def test_recursive_yaml_elsewhere_does_not_break_a_raw_write(cfg_path):
+    """An unrelated recursive alias must not make the raw snapshot copy
+    (_detached_copy) recurse forever."""
     import api.routes as routes
 
     cfg_path.write_text(
@@ -849,3 +577,287 @@ def test_recursive_yaml_elsewhere_does_not_break_a_save(cfg_path):
     assert _raw(cfg_path)["mcp_servers"]["local"]["args"] == ["--new"]
     _assert_refs_survive(cfg_path, "MCP update (recursive YAML elsewhere)", skip=("mcp.local.args", "mcp.local.env"))
 
+
+# ── An unchanged ${VAR} whose variable is EMPTY survives a save ────────────────
+#
+# A reference whose variable is set to "" is displayed as "" and re-submitted
+# as "". That is an unchanged field, so the reference must stay on disk; it
+# must not be removed or replaced by "".
+
+EMPTY_REF = "${HERMES_TEST_EMPTY}"
+
+
+def _aux_row(task: str) -> dict:
+    from api import config
+
+    return next(row for row in config.get_auxiliary_models()["tasks"] if row["task"] == task)
+
+
+def _advanced_as_displayed(shown: dict, *, main: bool) -> dict:
+    """The body the Settings advanced dialog posts back for unchanged fields."""
+    advanced = {
+        "base_url": shown.get("base_url") or "",
+        "extra_body": shown.get("extra_body") or {},
+        "api_key": "",
+        "api_key_clear": False,
+    }
+    if main:
+        advanced["service_tier"] = ""
+    else:
+        for field in ("timeout", "download_timeout", "max_concurrency"):
+            value = shown.get(field)
+            advanced[field] = "" if value is None else str(value)
+    return advanced
+
+
+def test_unchanged_empty_env_ref_survives_dashboard_save(cfg_path, monkeypatch):
+    from api import config, dashboard_probe
+
+    monkeypatch.setenv("HERMES_TEST_EMPTY", "")
+    _seed(cfg_path, lambda raw: raw["webui"]["dashboard"].__setitem__("url", EMPTY_REF))
+
+    shown = dashboard_probe.get_dashboard_config(config._load_yaml_config_file(cfg_path))
+    assert shown["url"] == ""
+    handler = _post("/api/dashboard/config", {"enabled": "always", "url": shown["url"]})
+    assert handler.status == 200, handler.json_body()
+
+    dashboard = _raw(cfg_path)["webui"]["dashboard"]
+    assert dashboard["enabled"] == "always"
+    assert dashboard.get("url") == EMPTY_REF, "the unchanged empty ${VAR} url was dropped"
+    _assert_refs_survive(cfg_path, "POST /api/dashboard/config (empty ref)")
+
+
+def test_unchanged_empty_env_ref_survives_auxiliary_advanced_save(cfg_path, monkeypatch):
+    monkeypatch.setenv("HERMES_TEST_EMPTY", "")
+
+    def mutate(raw):
+        raw["auxiliary"] = {
+            "vision": {"provider": "openai", "model": "gpt-4o", "base_url": EMPTY_REF, "timeout": 30}
+        }
+
+    _seed(cfg_path, mutate)
+    row = _aux_row("vision")
+    assert row["base_url"] == ""
+    handler = _post(
+        "/api/model/set",
+        {
+            "scope": "auxiliary",
+            "task": "vision",
+            "provider": row["provider"],
+            "model": row["model"],
+            "advanced": _advanced_as_displayed(row, main=False),
+        },
+    )
+    assert handler.status == 200, handler.json_body()
+
+    slot = _raw(cfg_path)["auxiliary"]["vision"]
+    assert slot.get("base_url") == EMPTY_REF, "the unchanged empty ${VAR} base_url was dropped"
+    assert slot["timeout"] == 30
+    _assert_refs_survive(cfg_path, "POST /api/model/set auxiliary advanced (empty ref)")
+
+
+def test_unchanged_empty_env_ref_survives_main_advanced_save(cfg_path, monkeypatch):
+    monkeypatch.setenv("HERMES_TEST_EMPTY", "")
+    _seed(cfg_path, lambda raw: raw["model"].__setitem__("base_url", EMPTY_REF))
+
+    from api import config
+
+    shown = config.get_auxiliary_models()["main"]
+    assert shown["base_url"] == ""
+    handler = _post(
+        "/api/model/set",
+        {
+            "scope": "main",
+            "provider": shown["provider"],
+            "model": shown["model"],
+            "advanced": _advanced_as_displayed(shown, main=True),
+        },
+    )
+    assert handler.status == 200, handler.json_body()
+
+    model = _raw(cfg_path)["model"]
+    assert model.get("base_url") == EMPTY_REF, "the unchanged empty ${VAR} base_url was dropped"
+    _assert_refs_survive(cfg_path, "POST /api/model/set main advanced (empty ref)")
+
+
+def test_preserve_env_ref_keeps_an_empty_reference_for_an_empty_submission(monkeypatch):
+    from api import config
+
+    monkeypatch.setenv("HERMES_TEST_EMPTY", "")
+    assert config._preserve_env_ref(EMPTY_REF, "") == EMPTY_REF
+    # A real change, or a reference that does not expand to "", is still written.
+    assert config._preserve_env_ref(EMPTY_REF, "https://typed.example.test") == "https://typed.example.test"
+    monkeypatch.setenv("HERMES_TEST_EMPTY", "https://set.example.test")
+    assert config._preserve_env_ref(EMPTY_REF, "") == ""
+
+
+# ── Synthetic secret end to end through every converted writer ───────────────
+
+SYNTH_SECRET = "sk-synthetic-123"
+SYNTH_URL = "https://llm.example.test/v1?key=" + SYNTH_SECRET
+
+SYNTH_SEED = """\
+model:
+  default: synthetic-model
+  provider: custom
+  base_url: ${SYNTH_URL}
+  api_key: ${SYNTH_KEY}
+  extra_body:
+    headers:
+      Authorization: Bearer ${SYNTH_KEY}
+providers:
+  openai:
+    api_key: ${SYNTH_KEY}
+auxiliary:
+  vision:
+    provider: openai
+    model: gpt-4o
+    api_key: ${SYNTH_KEY}
+    extra_body:
+      headers:
+        X-Key: ${SYNTH_KEY}
+mcp_servers:
+  bus:
+    url: https://mcp.example.test/sse
+    headers:
+      Authorization: Bearer ${SYNTH_KEY}
+      X-Alt: ${env:SYNTH_KEY}
+    args:
+      - --token
+      - ${SYNTH_KEY}
+skills:
+  disabled:
+    - some-skill
+dashboard:
+  kanban:
+    lane_by_profile: false
+webui:
+  dashboard:
+    enabled: auto
+"""
+
+
+def _assert_synth_refs_survive(path: Path, writer: str) -> None:
+    text = path.read_text(encoding="utf-8")
+    assert SYNTH_SECRET not in text, f"{writer} wrote the synthetic secret into config.yaml"
+    raw = _raw(path)
+    expected = {
+        "model.api_key": (raw["model"].get("api_key"), "${SYNTH_KEY}"),
+        "model.base_url": (raw["model"].get("base_url"), "${SYNTH_URL}"),
+        "model.extra_body": (
+            raw["model"].get("extra_body"),
+            {"headers": {"Authorization": "Bearer ${SYNTH_KEY}"}},
+        ),
+        "providers.openai.api_key": (raw["providers"]["openai"]["api_key"], "${SYNTH_KEY}"),
+        "auxiliary.vision.api_key": (raw["auxiliary"]["vision"].get("api_key"), "${SYNTH_KEY}"),
+        "auxiliary.vision.extra_body": (
+            raw["auxiliary"]["vision"].get("extra_body"),
+            {"headers": {"X-Key": "${SYNTH_KEY}"}},
+        ),
+        "mcp.bus.headers": (
+            raw["mcp_servers"]["bus"]["headers"],
+            {"Authorization": "Bearer ${SYNTH_KEY}", "X-Alt": "${env:SYNTH_KEY}"},
+        ),
+        "mcp.bus.args": (raw["mcp_servers"]["bus"]["args"], ["--token", "${SYNTH_KEY}"]),
+    }
+    for label, (actual, want) in expected.items():
+        assert actual == want, f"{writer} lost the ${{...}} reference at {label}: {actual!r}"
+
+
+def test_synthetic_secret_never_reaches_disk_through_any_converted_writer(
+    cfg_path, skill_exists, monkeypatch
+):
+    from api import config, dashboard_probe, kanban_bridge
+    from api.commands import execute_agent_command
+
+    monkeypatch.setenv("SYNTH_KEY", SYNTH_SECRET)
+    monkeypatch.setenv("SYNTH_URL", SYNTH_URL)
+    cfg_path.write_text(SYNTH_SEED, encoding="utf-8")
+    _reset_config_caches()
+    config.reload_config()
+    # The reader really resolves the secret, so a writer that saved an expanded
+    # view would leak it.
+    assert config._load_yaml_config_file(cfg_path)["model"]["api_key"] == SYNTH_SECRET
+
+    def check(writer, handler=None):
+        if handler is not None:
+            assert handler.status == 200, (writer, handler.json_body())
+        _assert_synth_refs_survive(cfg_path, writer)
+
+    check("POST /api/reasoning display", _post("/api/reasoning", {"display": "show"}))
+    assert _raw(cfg_path)["display"]["show_reasoning"] is True
+    check("POST /api/reasoning effort", _post("/api/reasoning", {"effort": "high"}))
+    assert _raw(cfg_path)["agent"]["reasoning_effort"] == "high"
+
+    check(
+        "POST /api/default-model",
+        _post("/api/default-model", {"model": "synthetic-model-2", "provider": "custom"}),
+    )
+    assert _raw(cfg_path)["model"]["default"] == "synthetic-model-2"
+
+    # Settings advanced dialogs post back what they displayed (env-resolved).
+    shown_main = config.get_auxiliary_models()["main"]
+    assert SYNTH_SECRET in json.dumps(shown_main["extra_body"])
+    assert SYNTH_SECRET in shown_main["base_url"]
+    check(
+        "POST /api/model/set main advanced",
+        _post(
+            "/api/model/set",
+            {
+                "scope": "main",
+                "provider": shown_main["provider"],
+                "model": shown_main["model"],
+                "advanced": _advanced_as_displayed(shown_main, main=True),
+            },
+        ),
+    )
+
+    check(
+        "POST /api/model/set auxiliary",
+        _post(
+            "/api/model/set",
+            {"scope": "auxiliary", "task": "vision", "provider": "openai", "model": "gpt-4o-mini"},
+        ),
+    )
+    assert _raw(cfg_path)["auxiliary"]["vision"]["model"] == "gpt-4o-mini"
+    row = _aux_row("vision")
+    assert SYNTH_SECRET in json.dumps(row["extra_body"])
+    advanced = _advanced_as_displayed(row, main=False)
+    advanced["timeout"] = "45"
+    check(
+        "POST /api/model/set auxiliary advanced",
+        _post(
+            "/api/model/set",
+            {
+                "scope": "auxiliary",
+                "task": "vision",
+                "provider": row["provider"],
+                "model": row["model"],
+                "advanced": advanced,
+            },
+        ),
+    )
+    assert _raw(cfg_path)["auxiliary"]["vision"]["timeout"] == 45
+
+    check(
+        "POST /api/dashboard/config",
+        _post("/api/dashboard/config", {"enabled": "always", "url": ""}),
+    )
+    assert _raw(cfg_path)["webui"]["dashboard"]["enabled"] == "always"
+    assert dashboard_probe.get_dashboard_config(config._load_yaml_config_file(cfg_path))["enabled"] == "always"
+
+    monkeypatch.setattr(kanban_bridge, "_config_payload", lambda *a, **k: {})
+    kanban_bridge._update_config_payload({"lane_by_profile": True})
+    check("kanban_bridge._update_config_payload")
+    assert _raw(cfg_path)["dashboard"]["kanban"]["lane_by_profile"] is True
+
+    _install_fake_codex_runtime_switch(monkeypatch)
+    monkeypatch.setattr(config, "get_config", lambda: config._load_yaml_config_file(cfg_path))
+    assert "codex_app_server" in execute_agent_command("/codex-runtime on")
+    check("/codex-runtime")
+    assert _raw(cfg_path)["model"]["openai_runtime"] == "codex_app_server"
+
+    check("POST /api/skills/toggle disable", _toggle("demo", False))
+    assert _raw(cfg_path)["skills"]["disabled"] == ["some-skill", "demo"]
+    check("POST /api/skills/toggle enable", _toggle("demo", True))
+    assert _raw(cfg_path)["skills"]["disabled"] == ["some-skill"]
