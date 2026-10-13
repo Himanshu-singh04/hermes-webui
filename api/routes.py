@@ -3417,7 +3417,6 @@ from api.config import (
     _get_config_path,
     _load_yaml_config_file,
     _load_yaml_config_file_raw,
-    _expand_env_vars,
     _has_env_ref,
     _save_yaml_config_file,
     reload_config,
