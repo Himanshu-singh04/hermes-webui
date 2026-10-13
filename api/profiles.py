@@ -1885,11 +1885,16 @@ def switch_profile(name: str, *, process_wide: bool = True) -> dict:
         from api.config import get_config
         cfg = get_config()
     else:
-        # Direct disk read — does not touch _cfg_cache
+        # Direct disk read — does not touch _cfg_cache. config.yaml keeps raw
+        # ``${VAR}`` references (#8032), so expand them under the TARGET
+        # profile's env (thread-local, process-env fallback blocked) before
+        # handing defaults to the frontend; otherwise New Chat would send the
+        # literal placeholders.
         try:
-            from api import yaml_compat as _yaml
+            from api.config import _load_yaml_config_file
             cfg_path = home / 'config.yaml'
-            cfg = _yaml.safe_load(cfg_path.read_text(encoding='utf-8')) if cfg_path.exists() else {}
+            with profile_env_for_thread_readonly(name, purpose="profile-switch defaults"):
+                cfg = _load_yaml_config_file(cfg_path) if cfg_path.exists() else {}
             if not isinstance(cfg, dict):
                 cfg = {}
         except Exception:
@@ -1902,6 +1907,12 @@ def switch_profile(name: str, *, process_wide: bool = True) -> dict:
     elif isinstance(model_cfg, dict):
         default_model = model_cfg.get('default')
         default_model_provider = model_cfg.get('provider')
+    # A reference the target profile can't resolve stays a literal ``${VAR}``
+    # after expansion; never hand that placeholder to New Chat (#8032).
+    if isinstance(default_model, str) and '${' in default_model:
+        default_model = None
+    if isinstance(default_model_provider, str) and '${' in default_model_provider:
+        default_model_provider = None
 
     # Read the target profile's workspace directly from *home* rather than via
     # get_last_workspace() which routes through the thread-local/process-global active

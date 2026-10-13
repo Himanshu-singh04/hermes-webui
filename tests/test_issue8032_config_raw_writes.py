@@ -959,3 +959,81 @@ def test_named_custom_auxiliary_endpoint_reference_is_not_expanded(cfg_path, mon
     assert handler.status == 200, handler.json_body()
     assert _raw(cfg_path)["auxiliary"]["vision"]["base_url"] == "${HERMES_TEST_NAMED_URL}"
     _assert_refs_survive(cfg_path, "POST /api/model/set auxiliary (named ${VAR} endpoint)")
+
+
+# ── Readers of the raw document must resolve ${VAR} where they used to rely on
+#    Settings saves having expanded it to disk (Codex r4 on #8129) ─────────────
+
+
+def _named_profile_tree(tmp_path, monkeypatch, *, profile_env: str):
+    import api.profiles as profiles
+
+    default_home = tmp_path / ".hermes"
+    target_home = default_home / "profiles" / "writer"
+    target_home.mkdir(parents=True)
+    (target_home / "config.yaml").write_text(
+        "model:\n  default: ${GATE_MODEL}\n  provider: ${GATE_PROVIDER}\n",
+        encoding="utf-8",
+    )
+    (target_home / ".env").write_text(profile_env, encoding="utf-8")
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", default_home)
+    monkeypatch.setattr(profiles, "_active_profile", "default")
+    monkeypatch.setattr(profiles, "list_profiles_api", lambda: [{"name": "default"}, {"name": "writer"}])
+    profiles._tls.profile = None
+    return profiles
+
+
+def test_per_client_profile_switch_returns_resolved_model_defaults(tmp_path, monkeypatch):
+    """A kept ``${VAR}`` default must reach New Chat as the profile's value,
+    not the literal placeholder."""
+    profiles = _named_profile_tree(
+        tmp_path, monkeypatch, profile_env="GATE_MODEL=gpt-4o\nGATE_PROVIDER=openai\n"
+    )
+    try:
+        result = profiles.switch_profile("writer", process_wide=False)
+    finally:
+        profiles._tls.profile = None
+    assert result["default_model"] == "gpt-4o"
+    assert result["default_model_provider"] == "openai"
+
+
+def test_per_client_profile_switch_never_returns_an_unresolved_placeholder(tmp_path, monkeypatch):
+    """The target profile's env, not the server process env, resolves its
+    defaults; an unresolvable reference is absent rather than a literal."""
+    monkeypatch.setenv("GATE_MODEL", "process-only-model")
+    monkeypatch.setenv("GATE_PROVIDER", "process-only-provider")
+    profiles = _named_profile_tree(tmp_path, monkeypatch, profile_env="UNRELATED=1\n")
+    try:
+        result = profiles.switch_profile("writer", process_wide=False)
+    finally:
+        profiles._tls.profile = None
+    assert result["default_model"] is None
+    assert result["default_model_provider"] is None
+
+
+def test_remove_provider_key_matches_an_env_backed_active_provider(cfg_path, monkeypatch):
+    """``model.provider: ${VAR}`` resolving to the removed provider must still
+    drop ``model.api_key``; the raw provider reference itself survives."""
+    from api import providers
+
+    monkeypatch.setenv("GATE_PROVIDER", "openai")
+    _seed(cfg_path, lambda raw: raw["model"].__setitem__("provider", "${GATE_PROVIDER}"))
+    providers._clean_provider_key_from_config("openai")
+    model = _raw(cfg_path)["model"]
+    assert "api_key" not in model
+    assert model["provider"] == "${GATE_PROVIDER}"
+    _assert_no_secret(cfg_path, "_clean_provider_key_from_config (env-backed provider)")
+
+
+def test_remove_provider_key_matches_an_env_backed_custom_provider_name(cfg_path, monkeypatch):
+    from api import providers
+
+    monkeypatch.setenv("GATE_CP_NAME", "Secret Endpoint")
+    _seed(cfg_path, lambda raw: raw["custom_providers"].append(
+        {"name": "${GATE_CP_NAME}", "base_url": "https://llm.example.test/v1", "api_key": REF}
+    ))
+    providers._clean_provider_key_from_config("custom:secret-endpoint")
+    entry = _raw(cfg_path)["custom_providers"][-1]
+    assert "api_key" not in entry
+    assert entry["name"] == "${GATE_CP_NAME}"
+    _assert_no_secret(cfg_path, "_clean_provider_key_from_config (env-backed custom name)")

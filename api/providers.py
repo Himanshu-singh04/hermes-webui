@@ -3102,10 +3102,19 @@ def _clean_provider_key_from_config(provider_id: str) -> None:
 
     try:
         from api import yaml_compat as _yaml
+        from api.profiles import profile_env_for_active_request_readonly
 
         changed = False
 
-        with _cfg_lock:
+        # config.yaml keeps raw ``${VAR}`` references (#8032): compare provider
+        # IDENTITY as the active profile resolves it, but delete from (and save)
+        # the raw document so no secret is expanded to disk. Enter the profile
+        # scope BEFORE the non-reentrant _cfg_lock so nothing it does can
+        # contend for the lock; inside, _expand_env_vars is a pure read of the
+        # thread-local env.
+        _resolved = _config._expand_env_vars
+
+        with profile_env_for_active_request_readonly(purpose="provider key removal"), _cfg_lock:
             raw = config_path.read_text(encoding="utf-8")
             cfg = _yaml.safe_load(raw)
             if not isinstance(cfg, dict):
@@ -3122,7 +3131,7 @@ def _clean_provider_key_from_config(provider_id: str) -> None:
             # 2. Clean model.api_key — only if this provider is the active one
             model_cfg = cfg.get("model", {})
             if isinstance(model_cfg, dict) and model_cfg.get("api_key"):
-                active_provider = model_cfg.get("provider")
+                active_provider = _resolved(model_cfg.get("provider"))
                 if active_provider and str(active_provider).strip().lower() == provider_id.lower():
                     del model_cfg["api_key"]
                     changed = True
@@ -3132,7 +3141,7 @@ def _clean_provider_key_from_config(provider_id: str) -> None:
             if isinstance(custom_providers, list):
                 for cp in custom_providers:
                     if isinstance(cp, dict):
-                        if _custom_provider_name_matches(provider_id, cp.get("name")):
+                        if _custom_provider_name_matches(provider_id, _resolved(cp.get("name"))):
                             if cp.get("api_key"):
                                 del cp["api_key"]
                                 changed = True
