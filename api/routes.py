@@ -8290,7 +8290,7 @@ def _read_profile_model_config(
         return None, None, None
 
     try:
-        from api.profiles import get_hermes_home_for_profile
+        from api.profiles import expand_profile_config, get_hermes_home_for_profile
 
         _profile_name = str(session.profile or "")
         _profile_home = get_hermes_home_for_profile(_profile_name)
@@ -8300,11 +8300,18 @@ def _read_profile_model_config(
         _pcfg = _read_profile_config_cached(_profile_name, _profile_cfg_path)
         if _pcfg is None:
             return None, None, None
+        # The cached parse is RAW: config.yaml keeps ``${VAR}`` references
+        # (#8032). Resolve them under the session profile's env binding, and
+        # treat a provider/default that stays unresolved as absent rather than
+        # forwarding the placeholder.
+        _pcfg = expand_profile_config(_profile_home, _pcfg)
         _model_cfg = _pcfg.get("model") or {}
         if not isinstance(_model_cfg, dict):
             return None, None, _pcfg
         _provider = (_model_cfg.get("provider") or "").strip() or None
         _default = (_model_cfg.get("default") or "").strip() or None
+        _provider = None if _has_env_ref(_provider) else _provider
+        _default = None if _has_env_ref(_default) else _default
     except Exception:
         logger.warning(
             "profile provider read failed for %r",
@@ -8408,10 +8415,9 @@ def _read_profile_config_cached(profile_name: str, cfg_path: str) -> dict | None
 def _sync_routing_kwargs(profile_cfg: dict | None, agent_params: set) -> dict:
     """Build the sync POST /api/chat provider_routing kwargs from a profile config.
 
-    ``profile_cfg`` is the raw dict returned by ``_read_profile_model_config()``:
-    a plain ``yaml.safe_load`` of the profile's ``config.yaml`` with NO env
-    expansion (that only runs in the main ``get_config()`` loader, which caches
-    the expanded view). Expanding with the same ``_expand_env_vars()`` the
+    ``profile_cfg`` is the dict returned by ``_read_profile_model_config()``,
+    already expanded under the session profile's env binding (#8032), or a
+    raw dict from another caller. Expanding with the same ``_expand_env_vars()`` the
     loader uses keeps a ``provider_routing`` reference such as
     ``only: [${ROUTE_PROVIDER}]`` from reaching the Agent as the literal
     ``${ROUTE_PROVIDER}`` string (and hence into OpenRouter's request body).
@@ -8442,33 +8448,6 @@ def _sync_routing_kwargs(profile_cfg: dict | None, agent_params: set) -> dict:
     # The shared helper drops (with a warning) any routing value that still
     # carries an unresolved ${...} after expansion, on both chat paths.
     return _provider_routing_kwargs_for_agent(cfg, agent_params)
-
-
-def _load_profile_config_dict(session) -> dict | None:
-    """Load the session profile's config.yaml as a dict, or None."""
-    if not getattr(session, "profile", None):
-        return None
-    try:
-        from api.profiles import get_hermes_home_for_profile
-
-        _profile_cfg_path = os.path.join(
-            str(get_hermes_home_for_profile(session.profile)),
-            "config.yaml",
-        )
-        if not os.path.isfile(_profile_cfg_path):
-            return None
-        from api import yaml_compat as yaml
-
-        with open(_profile_cfg_path, encoding="utf-8") as _f:
-            _pcfg = yaml.safe_load(_f) or {}
-        return _pcfg if isinstance(_pcfg, dict) else None
-    except Exception:
-        logger.warning(
-            "profile config read failed for %r",
-            getattr(session, "profile", None),
-            exc_info=True,
-        )
-        return None
 
 
 def _ordered_custom_provider_model_ids(entry: dict) -> list[str]:

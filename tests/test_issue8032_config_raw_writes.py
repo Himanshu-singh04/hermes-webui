@@ -1011,12 +1011,22 @@ def test_per_client_profile_switch_never_returns_an_unresolved_placeholder(tmp_p
     assert result["default_model_provider"] is None
 
 
+def _launch_env(monkeypatch, **values):
+    """Root ``${VAR}``s resolve against the launch-time env snapshot (plus root's
+    .env), never the live process env a named-profile worker mirrors into."""
+    from types import MappingProxyType
+
+    import api.paths as paths
+
+    monkeypatch.setattr(paths, "STARTUP_ENV", MappingProxyType({**paths.STARTUP_ENV, **values}))
+
+
 def test_remove_provider_key_matches_an_env_backed_active_provider(cfg_path, monkeypatch):
     """``model.provider: ${VAR}`` resolving to the removed provider must still
     drop ``model.api_key``; the raw provider reference itself survives."""
     from api import providers
 
-    monkeypatch.setenv("GATE_PROVIDER", "openai")
+    _launch_env(monkeypatch, GATE_PROVIDER="openai")
     _seed(cfg_path, lambda raw: raw["model"].__setitem__("provider", "${GATE_PROVIDER}"))
     providers._clean_provider_key_from_config("openai")
     model = _raw(cfg_path)["model"]
@@ -1028,7 +1038,7 @@ def test_remove_provider_key_matches_an_env_backed_active_provider(cfg_path, mon
 def test_remove_provider_key_matches_an_env_backed_custom_provider_name(cfg_path, monkeypatch):
     from api import providers
 
-    monkeypatch.setenv("GATE_CP_NAME", "Secret Endpoint")
+    _launch_env(monkeypatch, GATE_CP_NAME="Secret Endpoint")
     _seed(cfg_path, lambda raw: raw["custom_providers"].append(
         {"name": "${GATE_CP_NAME}", "base_url": "https://llm.example.test/v1", "api_key": REF}
     ))
