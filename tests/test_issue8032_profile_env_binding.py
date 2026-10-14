@@ -312,28 +312,25 @@ _ALLOWED = {
 }
 
 
+def _collect_raw_loads(node, module, stack, sites):
+    scoped = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    if scoped:
+        stack.append(node.name)
+    if isinstance(node, ast.Call):
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
+        if name in _RAW_LOADERS:
+            sites.setdefault((module, ".".join(stack) or "<module>"), []).append(node.lineno)
+    for child in ast.iter_child_nodes(node):
+        _collect_raw_loads(child, module, stack, sites)
+    if scoped:
+        stack.pop()
+
+
 def _raw_load_sites():
     sites = {}
     for path in sorted(API_DIR.glob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        stack = []
-
-        def visit(node):
-            scoped = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-            if scoped:
-                stack.append(node.name)
-            if isinstance(node, ast.Call):
-                func = node.func
-                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
-                if name in _RAW_LOADERS:
-                    key = (path.name, ".".join(stack) or "<module>")
-                    sites.setdefault(key, []).append(node.lineno)
-            for child in ast.iter_child_nodes(node):
-                visit(child)
-            if scoped:
-                stack.pop()
-
-        visit(tree)
+        _collect_raw_loads(ast.parse(path.read_text(encoding="utf-8")), path.name, [], sites)
     return sites
 
 
