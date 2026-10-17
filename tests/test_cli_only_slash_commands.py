@@ -117,13 +117,19 @@ def test_cli_only_response_mentions_webui_scope():
 
 
 def test_prompt_style_cli_only_response_points_at_a_bare_prompt():
-    """Prompt-style registry commands (/plan, /review, /learn) tell the user to
-    send the text without the slash, since that asks the agent directly."""
+    """Prompt-style registry commands (/plan, /review, /learn) tell the user
+    their de-slashed text is ALREADY in the composer and to press Send, since
+    that asks the agent directly (#7683 review round 3)."""
     assert "const PROMPT_STYLE_CLI_ONLY_COMMANDS=new Set(['plan','review','learn']);" in COMMANDS_JS
     response_idx = COMMANDS_JS.find("function cliOnlyCommandResponse")
     response = COMMANDS_JS[response_idx : response_idx + 1200]
     assert "PROMPT_STYLE_CLI_ONLY_COMMANDS.has(name)" in response
-    assert "Send it without the slash to ask the agent directly." in response
+    # The old wording ("Send it without the slash...") read as an
+    # instruction to retype the whole prompt, and following it literally
+    # produced "plan write a migration plan…".
+    assert "Send it without the slash to ask the agent directly." not in response
+    assert "Your request is in the composer without the slash." in response
+    assert "Press Send to ask the agent directly." in response
 
 
 def test_browser_cli_only_response_explains_server_side_browser_tools():

@@ -542,12 +542,22 @@ function cliOnlyCommandResponse(cmdName, meta){
   const detail=desc?`\n\n${desc}`:'';
   let extra='';
   if(PROMPT_STYLE_CLI_ONLY_COMMANDS.has(name)){
-    extra='\n\nSend it without the slash to ask the agent directly.';
+    extra='\n\nYour request is in the composer without the slash. Press Send to ask the agent directly.';
+  }
+  if(name==='bg'){
+    extra='\n\nWebUI has the same thing: `/background` runs a prompt in a background session.';
   }
   if(name==='browser'){
     extra='\n\nBrowser tools in WebUI must be configured server-side with the agent/browser environment. Once configured, ask the model to use browser tools directly; `/browser` itself only works in `hermes chat`.';
   }
   return `\`/${name}\` isn't available in the WebUI.${detail}${extra}`;
+}
+
+// True when a CLI-only explainer tells the user their de-slashed text is
+// already in the composer (#7683 review round 3). send() keeps the composer
+// text in that case so the user presses Send instead of retyping.
+function isPromptStyleCliOnlyCommand(name){
+  return PROMPT_STYLE_CLI_ONLY_COMMANDS.has(String(name||'').trim());
 }
 
 async function executeAgentCommand(text,_meta){
@@ -686,7 +696,14 @@ function cmdHelp(){
     // after #7675 follow-up #2, so render it verbatim with one leading
     // space -- adding another pair here produced `<<model_name>>` (#7683).
     const usage=c.arg ? ` ${normalizeArgHint(c.arg)}` : '';
-    return `  /${c.name}${usage} — ${c.desc}`;
+    // Wrap the command + usage in a code span. This text is pushed as an
+    // assistant message, so it goes through renderMd(), and that pipeline
+    // decodes HTML entities FIRST and then drops anything shaped like an
+    // unknown HTML tag -- so bare `<effort>` / `<model_name>` vanish from the
+    // rendered row (`/reasoning [show|hide|]`, `/model `) and escaping them
+    // cannot help (#7683 review round 3). A code span is stashed before every
+    // markdown pass, so the brackets survive.
+    return `  \`/${c.name}${usage}\` — ${c.desc}`;
   });
   const msg={role:'assistant',content:t('available_commands')+'\n'+lines.join('\n')};
   S.messages.push(msg);

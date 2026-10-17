@@ -1794,6 +1794,20 @@ async function send(){
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
         S.messages.push({role:'assistant',content:cliOnlyCommandResponse(_parsedCmd.name,_agentCmd),_ts:Date.now()/1000});
         renderMessages();
+        // Prompt-style commands (plan/review/learn) tell the user their
+        // request is already in the composer, so leave the de-slashed text
+        // there instead of clearing it (#7683 review round 3). Clearing it
+        // forced a full retype of the prompt.
+        if(typeof isPromptStyleCliOnlyCommand==='function'
+           && isPromptStyleCliOnlyCommand(_agentCmd.name||_parsedCmd.name)){
+          const _el=$('msg');
+          if(_el){
+            _el.value=text.replace(/^\s*\/\S+\s*/,'');
+            if(typeof autoResize==='function')autoResize();
+          }
+          hideCmdDropdown();
+          return;
+        }
         $('msg').value='';autoResize();hideCmdDropdown();return;
       }
       // Non-dispatchable registry commands (e.g. /agents) must not leak as
@@ -1818,6 +1832,19 @@ async function send(){
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
         S.messages.push({role:'assistant',content:cliOnlyCommandResponse(_parsedCmd.name,_agentCmd),_ts:Date.now()/1000});
         renderMessages();
+        // Prompt-style commands (plan/review/learn) keep the de-slashed text
+        // in the composer so the user presses Send instead of retyping
+        // (#7683 review round 3).
+        if(typeof isPromptStyleCliOnlyCommand==='function'
+           && isPromptStyleCliOnlyCommand(_agentCmd.name||_parsedCmd.name)){
+          const _el=$('msg');
+          if(_el){
+            _el.value=text.replace(/^\s*\/\S+\s*/,'');
+            if(typeof autoResize==='function')autoResize();
+          }
+          hideCmdDropdown();
+          return;
+        }
         $('msg').value='';autoResize();hideCmdDropdown();return;
       }
       const _agentCmdName=String(_agentCmd&&_agentCmd.name||_parsedCmd&&_parsedCmd.name||'').trim().toLowerCase();

@@ -28,6 +28,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMMANDS_JS = (REPO_ROOT / "static" / "commands.js").read_text(encoding="utf-8")
 MESSAGES_JS = (REPO_ROOT / "static" / "messages.js").read_text(encoding="utf-8")
+UI_JS = (REPO_ROOT / "static" / "ui.js").read_text(encoding="utf-8")
 
 pytestmark = pytest.mark.skipif(
     subprocess.run(["which", "node"], capture_output=True).returncode != 0,
@@ -65,6 +66,45 @@ _REGISTRY_PAYLOAD = [
         "aliases": ["reload_skills"],
         "cli_only": False,
         "gateway_only": False,
+    },
+    # Prompt-style CLI-only commands (#7683 review round 2): the WebUI has no
+    # native handler, so they route through the explainer, but the de-slashed
+    # text must stay in the composer instead of forcing a retype.
+    {
+        "name": "plan",
+        "description": "Write a migration plan",
+        "category": "Session",
+        "aliases": [],
+        "cli_only": True,
+        "args_hint": "<prompt>",
+    },
+    {
+        "name": "review",
+        "description": "Review a design",
+        "category": "Session",
+        "aliases": [],
+        "cli_only": True,
+        "args_hint": "<prompt>",
+    },
+    {
+        "name": "learn",
+        "description": "Learn a topic",
+        "category": "Session",
+        "aliases": [],
+        "cli_only": True,
+        "args_hint": "<prompt>",
+    },
+    # /bg mirrors the real hermes_cli registry entry (category Session, NOT
+    # cli_only, NOT WebUI-dispatchable): it is the CLI alias for the
+    # background task prompt, and the WebUI has the same thing natively as
+    # /background (#7683 review round 2).
+    {
+        "name": "bg",
+        "description": "Run a background task",
+        "category": "Session",
+        "aliases": [],
+        "cli_only": False,
+        "args_hint": "<prompt>",
     },
 ]
 
@@ -799,3 +839,203 @@ def test_bundle_rows_survive_a_registry_failure():
         "loaded bundles must stay in autocomplete when only the command "
         f"registry failed, got matches: {names!r}"
     )
+
+
+# ── Round-3 finding 1 (MUST-FIX): /help must keep `<effort>` after render ────
+
+
+def _run_render_md(raw: str) -> str:
+    """Execute the REAL renderMd() from static/ui.js against ``raw`` and
+    return the resulting HTML.
+
+    The app renders every assistant message through renderMd(), and that
+    // pipeline strips angle-bracket tokens that are not inside a code span: it
+    decodes HTML entities FIRST (so escaping ``<`` as ``&lt;`` cannot help),
+    then drops anything shaped like an unknown HTML tag (``<effort>``) before
+    the text is escaped. This is exactly why ``/reasoning``'s arg hint lost
+    its ``<effort>`` option (#7683 review round 3).
+    """
+    script = textwrap.dedent(
+        """
+        const vm = require('vm');
+        const src = __UI_JS__;
+        // renderMd is a top-level function that closes over ui.js helpers
+        // (esc, _mediaTokenParts, _inlineMediaHtmlForRef, _markdownHref,
+        // _matchBacktickFenceLine, _isBacktickFenceClose, ...).  Evaluate the
+        // Evaluate the whole file in a sandbox with just enough browser surface.
+        const el = () => ({
+          addEventListener(){}, removeEventListener(){},
+          classList: { add(){}, remove(){} },
+          style: {}, dataset: {}, value: '', textContent: '', innerHTML: '',
+        });
+        const ctx = {
+          console, Math, JSON, Object, Array, String, Number, Boolean,
+          RegExp, Error, Promise, Set, Map, Date,
+          setTimeout: () => 0, clearTimeout: () => 0,
+          setInterval: () => 0, clearInterval: () => 0,
+          t: key => key,
+          navigator: { userAgent: 'node' },
+          location: { href: 'http://localhost/', search: '' },
+          MutationObserver: function(){ this.observe = () => {}; this.disconnect = () => {}; },
+          ResizeObserver: function(){ this.observe = () => {}; this.disconnect = () => {}; },
+          IntersectionObserver: function(){ this.observe = () => {}; this.disconnect = () => {}; },
+          matchMedia: () => ({ matches: false, addEventListener(){}, removeEventListener(){} }),
+          document: {
+            addEventListener(){}, removeEventListener(){},
+            getElementById(){ return null; },
+            querySelector(){ return null; },
+            querySelectorAll(){ return []; },
+            createElement(){ return el(); },
+            body: { appendChild(){}, classList: { add(){}, remove(){} } },
+            addEventListener(){}, removeEventListener(){},
+          },
+          window: { addEventListener(){}, requestAnimationFrame(cb){ return 1; } },
+          localStorage: { getItem(){ return null; }, setItem(){}, removeItem(){} },
+        };
+        ctx.globalThis = ctx;
+        ctx.window.window = ctx.window;
+        vm.createContext(ctx);
+        vm.runInContext(src, ctx);
+        const html = ctx.renderMd(__RAW__);
+        console.log(JSON.stringify(html));
+        """
+    ).replace("__UI_JS__", json.dumps(UI_JS)).replace("__RAW__", json.dumps(raw))
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".js", delete=False, encoding="utf-8"
+    ) as fh:
+        fh.write(script)
+        path = Path(fh.name)
+    try:
+        proc = subprocess.run(
+            ["node", str(path)], capture_output=True, text=True, timeout=60
+        )
+        assert proc.returncode == 0, proc.stderr
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def test_help_reasoning_hint_survives_the_real_markdown_renderer():
+    """#7683 review round 3 (MUST-FIX): the ``/reasoning`` row must keep its
+    ``<effort>`` option through renderMd().
+
+    ``/help``'s content is an assistant message, so it goes through the
+    markdown pipeline.  Bare ``[show|hide|<effort>]`` loses ``<effort>`` to
+    the unknown-tag strip; the command + usage must be wrapped in a code span
+    (which is stashed before every markdown pass) so the row survives.
+    """
+    content = _run_cmd_help()
+    html = _run_render_md(content)
+    assert "/reasoning" in html
+    # The code span escapes its content, so the HTML carries &lt;effort&gt; --
+    # the browser decodes it back to <effort> for display. Either way the
+    # character survives the markdown pass, which is what the reviewer's
+    # "renders /reasoning [show|hide|<effort>] — …" check is about.
+    assert "<code>/reasoning [show|hide|&lt;effort&gt;]</code>" in html, (
+        f"the rendered /reasoning row lost its <effort> option (or is not a "
+        f"code span) -- bare angle brackets are dropped by renderMd: {html!r}"
+    )
+
+
+def test_help_model_row_keeps_its_required_placeholder():
+    """#7683 review round 3: the same code-span wrap also repairs the
+    pre-existing vanishing ``<required>`` placeholders (``/model``, ``/use``,
+    ``/queue``, ``/btw``, ``/background``)."""
+    content = _run_cmd_help()
+    html = _run_render_md(content)
+    for row in (
+        "/model <model_name>",
+        "/use <skill-name>",
+        "/queue <message>",
+        "/btw <question>",
+        "/background <prompt>",
+    ):
+        # The code span escapes the angle brackets (correct: the browser
+        # decodes them for display), so match the escaped HTML form.
+        escaped = row.replace("<", "&lt;").replace(">", "&gt;")
+        assert f"<code>{escaped}</code>" in html, (
+            f"{row!r} must render inside a code span so renderMd keeps its "
+            f"angle brackets, got: {html!r}"
+        )
+
+
+# ── Round-3 finding 2 (SHOULD-FIX): prompt-style commands keep the text ─────
+
+
+def test_prompt_style_command_leaves_the_de_slashed_text_in_the_composer():
+    """#7683 review round 3 (SHOULD-FIX): for the three prompt-style commands
+    the WebUI cannot execute (``/plan``, ``/review``, ``/learn``), the explainer
+    must leave the de-slashed prompt in the composer instead of clearing it.
+
+    Typing ``/plan write a migration plan for the users table`` and following
+    the explainer's own advice ("Send it without the slash") used to cost a
+    full retype, because send() cleared the composer before the user could
+    read the message.  Keeping the text means one keypress (Send) instead.
+    """
+    for name in ("/plan", "/review", "/learn"):
+        out = _run_send(
+            f"{name} write a migration plan for the users table",
+            "await send(); return {};",
+        )
+        assistant = [m for m in out["messages"] if m["role"] == "assistant"]
+        assert any(
+            "isn't available in the WebUI" in m["content"] for m in assistant
+        ), f"{name} must be answered by the CLI-only explainer, got {assistant!r}"
+        assert out["remainingInput"] == "write a migration plan for the users table", (
+            f"{name} must leave the de-slashed prompt in the composer (got "
+            f"{out['remainingInput']!r}) -- clearing it forces the user to "
+            f"retype the whole prompt."
+        )
+
+
+def test_prompt_style_explainer_wording_points_at_the_composer():
+    """#7683 review round 3 (SHOULD-FIX): the third line must tell the user
+    their text is ALREADY in the composer, so pressing Send asks the agent
+    directly.  The old wording ("Send it without the slash") reads as an
+    instruction to retype, and following it literally produced
+    "plan write a migration plan…".
+    """
+    out = _run_send("/plan write a migration plan", "await send(); return {};")
+    assistant = [m["content"] for m in out["messages"] if m["role"] == "assistant"]
+    text = "\n".join(assistant)
+    assert "composer" in text, (
+        f"the explainer must mention the composer, got: {assistant!r}"
+    )
+    assert "Press Send" in text, (
+        f"the explainer must tell the user to press Send, got: {assistant!r}"
+    )
+
+
+def test_prompt_style_composer_restore_covers_the_no_arg_form():
+    """A bare ``/plan`` (no prompt): there is no typed request to preserve,
+    so the composer ends up empty and the user types their task fresh.  The
+    important part is that the branch still answers with the explainer rather
+    than crashing or re-triggering itself on the next Send."""
+    out = _run_send("/plan", "await send(); return {};")
+    assistant = [m for m in out["messages"] if m["role"] == "assistant"]
+    assert any("isn't available in the WebUI" in m["content"] for m in assistant), (
+        f"a bare /plan must still get the explainer, got {assistant!r}"
+    )
+    assert out["remainingInput"] == "", (
+        f"a bare /plan has no de-slashed text, so the composer should be empty "
+        f"rather than re-triggering the explainer on the next Send, got "
+        f"{out['remainingInput']!r}"
+    )
+
+
+# ── Round-3 finding 3 (SHOULD-FIX): /bg points at the WebUI /background ─────
+
+
+def test_bg_explainer_points_at_the_webui_background_command():
+    """#7683 review round 3 (SHOULD-FIX): ``/bg`` is the CLI's background-task
+    command.  The WebUI has the SAME thing natively as ``/background``, so the
+    explainer must point there instead of just saying "isn't available".
+    """
+    out = _run_send("/bg audit the users table", "await send(); return {};")
+    assistant = [m["content"] for m in out["messages"] if m["role"] == "assistant"]
+    text = "\n".join(assistant)
+    assert "/background" in text, (
+        f"the /bg explainer must point at the WebUI's /background command, "
+        f"got: {assistant!r}"
+    )
+
