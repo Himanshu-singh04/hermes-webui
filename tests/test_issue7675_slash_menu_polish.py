@@ -154,10 +154,21 @@ def test_normalize_arg_hint_helper_handles_three_shapes():
         """
     )
     import subprocess
+    import tempfile
 
-    result = subprocess.run(
-        ["node", "-e", script], capture_output=True, text=True, timeout=10
-    )
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".js", delete=False, encoding="utf-8"
+    ) as handle:
+        handle.write(script)
+        script_path = handle.name
+    try:
+        result = subprocess.run(
+            ["node", script_path], capture_output=True, text=True, timeout=20
+        )
+    finally:
+        import os
+
+        os.unlink(script_path)
     assert result.returncode == 0, f"Node VM failed: {result.stderr}"
     outputs = json.loads(result.stdout.strip().splitlines()[-1])
     assert outputs == [c[1] for c in cases], (
@@ -336,11 +347,26 @@ def _drive_get_matching_commands(*, pet_meta):
         console.log(JSON.stringify(petRows));
         """
     )
+    # The stripped commands.js plus the driver script are written to a temp
+    # file and executed as `node <file>` rather than inlined into `node -e`:
+    # master's commands.js is large enough that the combined script exceeds
+    # ARG_MAX and subprocess dies with E2BIG (argument list too long).
     import subprocess
+    import tempfile
 
-    result = subprocess.run(
-        ["node", "-e", script], capture_output=True, text=True, timeout=10
-    )
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".js", delete=False, encoding="utf-8"
+    ) as handle:
+        handle.write(script)
+        script_path = handle.name
+    try:
+        result = subprocess.run(
+            ["node", script_path], capture_output=True, text=True, timeout=20
+        )
+    finally:
+        import os
+
+        os.unlink(script_path)
     assert result.returncode == 0, f"Node VM failed: {result.stderr}"
     return json.loads(result.stdout.strip().splitlines()[-1])
 
@@ -410,10 +436,21 @@ def test_get_matching_commands_builtin_uses_angle_brackets():
         """
     )
     import subprocess
+    import tempfile
 
-    result = subprocess.run(
-        ["node", "-e", script], capture_output=True, text=True, timeout=10
-    )
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".js", delete=False, encoding="utf-8"
+    ) as handle:
+        handle.write(script)
+        script_path = handle.name
+    try:
+        result = subprocess.run(
+            ["node", script_path], capture_output=True, text=True, timeout=20
+        )
+    finally:
+        import os
+
+        os.unlink(script_path)
     assert result.returncode == 0, f"Node VM failed: {result.stderr}"
     bad = json.loads(result.stdout.strip().splitlines()[-1])
     assert not bad, (
