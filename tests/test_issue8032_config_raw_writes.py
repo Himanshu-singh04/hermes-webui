@@ -729,6 +729,24 @@ def test_unchanged_empty_env_ref_survives_main_advanced_save(cfg_path, monkeypat
     _assert_refs_survive(cfg_path, "POST /api/model/set main advanced (empty ref)")
 
 
+def test_advanced_extra_body_type_change_is_saved_and_unchanged_object_keeps_refs(monkeypatch):
+    """#8129 r7: {"x": 1} -> {"x": true} is a change (Python's 1 == True must not hide it)."""
+    from api import config
+
+    model_cfg = {"extra_body": {"x": 1}}
+    config._apply_advanced_model_options(model_cfg, {"extra_body": {"x": True}})
+    assert model_cfg["extra_body"] == {"x": True} and model_cfg["extra_body"]["x"] is True
+
+    model_cfg = {"extra_body": {"n": 1}}
+    config._apply_advanced_model_options(model_cfg, {"extra_body": '{"n": 1.0}'})
+    assert model_cfg["extra_body"]["n"] == 1.0 and isinstance(model_cfg["extra_body"]["n"], float)
+
+    monkeypatch.setenv("HERMES_TEST_EB", "resolved")
+    model_cfg = {"extra_body": {"h": "${HERMES_TEST_EB}", "on": True}}
+    config._apply_advanced_model_options(model_cfg, {"extra_body": {"h": "resolved", "on": True}})
+    assert model_cfg["extra_body"] == {"h": "${HERMES_TEST_EB}", "on": True}, "an unchanged object lost its reference"
+
+
 def test_preserve_env_ref_keeps_an_empty_reference_for_an_empty_submission(monkeypatch):
     from api import config
 

@@ -8,6 +8,7 @@ Profile switches update os.environ['HERMES_HOME'] and monkey-patch module-level
 cached paths in hermes-agent modules (skills_tool, skill_manager_tool,
 cron/jobs) that snapshot HERMES_HOME at import time.
 """
+import copy
 import json
 import logging
 import os
@@ -996,12 +997,27 @@ def _profile_env_binding(home, dotenv: dict[str, str]) -> dict[str, str]:
 
     env: dict[str, str] = {}
     if _is_root_profile_home(home):
-        # Explicit ROOT binding: the launch-time snapshot is taken at import,
-        # before any worker mirrors a named profile into os.environ; keys a
-        # profile .env load put there (the launcher's or _reload_dotenv's) are
-        # dropped, and root's own .env below restores the ones it defines.
-        loaded = set(_loaded_profile_env_keys)
-        env.update((k, v) for k, v in _paths.STARTUP_ENV.items() if k not in loaded)
+        # Explicit ROOT binding from the launch-time snapshot, taken at import:
+        # it predates every _reload_dotenv() and every worker that mirrors a
+        # named profile into os.environ, so a key the loader mirrored later is
+        # still the LAUNCHER's value here and root keeps it. The only
+        # profile-owned values the snapshot can hold are those a shell launcher
+        # (ctl.sh) sourced from a NAMED launch home's .env before Python
+        # started. #8435's provenance record (_INITIAL_HERMES_HOME_DOTENV)
+        # identifies them by value, the same rule as
+        # api.gateway_chat._env_value_is_profile_sourced(): a non-empty value
+        # equal to the named launch home's .env value is that profile's and is
+        # dropped (fail closed, even when the launcher exported it too). Root's
+        # own .env below restores the keys it defines.
+        launch_dotenv: dict[str, str] = {}
+        if _INITIAL_HERMES_HOME and not _is_root_profile_home(_INITIAL_HERMES_HOME):
+            launch_dotenv = _INITIAL_HERMES_HOME_DOTENV
+
+        def _from_named_launch_home(key, value) -> bool:
+            value = str(value or "").strip()
+            return bool(value) and key in launch_dotenv and str(launch_dotenv[key] or "").strip() == value
+
+        env.update((k, v) for k, v in _paths.STARTUP_ENV.items() if not _from_named_launch_home(k, v))
     env.update(filter_runtime_env_for_gateway_parity(dotenv))
     env['HERMES_HOME'] = str(Path(home).expanduser())
     return env
@@ -1014,8 +1030,9 @@ def profile_env_binding(home) -> dict[str, str]:
       (fail-closed profile isolation, #3961);
     * root profile: the launch-time env snapshot (``api.paths.STARTUP_ENV``,
       taken before any worker mirrors a named profile into ``os.environ``)
-      minus the keys a profile ``.env`` load put into the process env
-      (``_loaded_profile_env_keys``), under root's own ``.env``. It is bound
+      without the values a shell launcher sourced from a NAMED launch home's
+      ``.env`` (``_INITIAL_HERMES_HOME_DOTENV``, #8435), under root's own
+      ``.env``. It is bound
       explicitly instead of falling back to live ``os.environ``: a
       process-wide switch loads a named profile's ``.env`` into it and every
       streaming turn / background worker mirrors its named profile's env into
@@ -1045,7 +1062,14 @@ def expand_profile_config(home, raw, *, env: Optional[dict] = None):
     _thread_ctx.env = dict(env)
     _thread_ctx.block_process_env_fallback = True
     try:
-        return _expand_env_vars(raw)
+        try:
+            return _expand_env_vars(raw)
+        except RecursionError:
+            # A recursive YAML alias elsewhere in the document must not hide
+            # the profile's ordinary settings: keep the raw tree (its ${VAR}
+            # literals read as absent via _has_env_ref) instead of {}.
+            logger.debug("profile config at %s has a recursive alias; served unexpanded", home)
+            return copy.deepcopy(raw)
     finally:
         _thread_ctx.block_process_env_fallback = previous_block
         if previous_env is None:

@@ -6595,6 +6595,11 @@ def _main_model_request_overrides(
     return overrides
 
 
+def _same_json_value(a, b) -> bool:
+    """Equal as JSON, so type edits count: Python treats 1 == True == 1.0 (#8129 r7)."""
+    return json.dumps(a, sort_keys=True, default=str) == json.dumps(b, sort_keys=True, default=str)
+
+
 def _apply_advanced_model_options(model_cfg: dict, advanced: dict | None) -> None:
     """Apply supported advanced model options to a config block in-place."""
     if advanced is None:
@@ -6634,7 +6639,7 @@ def _apply_advanced_model_options(model_cfg: dict, advanced: dict | None) -> Non
         elif isinstance(extra_body, dict):
             if not extra_body:
                 model_cfg.pop("extra_body", None)
-            elif _expand_env_vars(model_cfg.get("extra_body")) != extra_body:
+            elif not _same_json_value(_expand_env_vars(model_cfg.get("extra_body")), extra_body):
                 # Only a changed object is written: re-submitting the displayed
                 # (resolved) one unchanged keeps the raw block and its ${VAR}
                 # references (#8032).

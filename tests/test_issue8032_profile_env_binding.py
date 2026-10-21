@@ -235,7 +235,7 @@ def test_r5_5_profile_skill_counts_expand_env_backed_disabled_list(tree):
 # ── The binding itself ──
 
 
-def test_root_binding_is_launch_env_minus_profile_loaded_keys_under_root_dotenv(tree, monkeypatch):
+def test_root_binding_keeps_launcher_values_the_loader_mirrored_under_root_dotenv(tree, monkeypatch):
     profiles = tree.profiles
     _launch_env(tree, monkeypatch, GATE_LAUNCH="launch", GATE_LOADED="named-profile", GATE_BOTH="launch")
     monkeypatch.setattr(profiles, "_loaded_profile_env_keys", {"GATE_LOADED"})
@@ -245,12 +245,66 @@ def test_root_binding_is_launch_env_minus_profile_loaded_keys_under_root_dotenv(
     root = profiles.profile_env_binding(tree.root)
     assert root["GATE_LAUNCH"] == "launch"
     assert root["GATE_BOTH"] == "root-dotenv"
-    assert "GATE_LOADED" not in root and "GATE_LIVE_ONLY" not in root
+    assert root["GATE_LOADED"] == "named-profile"  # launcher value predates the loader
+    assert "GATE_LIVE_ONLY" not in root
     assert root["HERMES_HOME"] == str(tree.root)
 
     (tree.writer / ".env").write_text("GATE_OWN=1\n", encoding="utf-8")
     named = profiles.profile_env_binding(tree.writer)
     assert named == {"GATE_OWN": "1", "HERMES_HOME": str(tree.writer)}
+
+
+def _launched_in(tree, monkeypatch, home, dotenv):
+    """Simulate ctl.sh: it sourced *home*'s .env (recorded at startup as *dotenv*) before Python started."""
+    monkeypatch.setattr(tree.profiles, "_INITIAL_HERMES_HOME", str(home))
+    monkeypatch.setattr(tree.profiles, "_INITIAL_HERMES_HOME_DOTENV", dict(dotenv))
+
+
+def test_root_binding_drops_values_a_named_launch_home_sourced(tree, monkeypatch):
+    """#8129 r7 [CORE]: launched in a named profile, root must not resolve that profile's secrets.
+
+    The loaded-key set is replaced by every later .env reload (a switch, a self-hosted setup in
+    another profile), so it cannot identify the launch profile's values; the startup provenance
+    record can.
+    """
+    profiles = tree.profiles
+    _launched_in(tree, monkeypatch, tree.writer, {"GATE_SECRET": "named-secret", "GATE_SHARED": "profile-value"})
+    _launch_env(
+        tree, monkeypatch, GATE_SECRET="named-secret", GATE_SHARED="launcher-export", GATE_EMPTY="", GATE_LAUNCH="launch"
+    )
+    monkeypatch.setattr(profiles, "_loaded_profile_env_keys", {"SOMETHING_ELSE"})
+
+    root = profiles.profile_env_binding(tree.root)
+    assert "GATE_SECRET" not in root, "the named launch profile's secret reached root's binding"
+    assert root["GATE_SHARED"] == "launcher-export", "an independent launcher export was dropped"
+    assert root["GATE_EMPTY"] == "", "an empty launcher value is not a profile's value"
+    assert root["GATE_LAUNCH"] == "launch"
+    assert profiles.expand_profile_config(tree.root, {"default": "${GATE_SECRET}"}) == {"default": "${GATE_SECRET}"}
+
+    (tree.root / ".env").write_text("GATE_SECRET=root-own\n", encoding="utf-8")
+    assert profiles.profile_env_binding(tree.root)["GATE_SECRET"] == "root-own", "root's own .env still applies"
+
+
+def test_root_binding_keeps_values_when_the_launch_home_is_root(tree, monkeypatch):
+    """Root's .env is shared by definition: launching in root sources nothing profile-private."""
+    _launched_in(tree, monkeypatch, tree.root, {"GATE_SECRET": "root-launch"})
+    _launch_env(tree, monkeypatch, GATE_SECRET="root-launch")
+    assert tree.profiles.profile_env_binding(tree.root)["GATE_SECRET"] == "root-launch"
+
+
+def test_expand_profile_config_serves_a_recursive_alias_document_unexpanded(tree):
+    """A self-referencing YAML alias must not hide the profile's ordinary settings."""
+    from api.config import _thread_ctx
+
+    (tree.writer / ".env").write_text("GATE_X=named\n", encoding="utf-8")
+    (tree.writer / "config.yaml").write_text(
+        "terminal:\n  backend: local\nmodel:\n  default: ${GATE_X}\nloop: &loop\n  - *loop\n", encoding="utf-8"
+    )
+    previous = getattr(_thread_ctx, "env", None)
+    loaded = tree.profiles.load_profile_config(tree.writer)
+    assert loaded["terminal"] == {"backend": "local"}
+    assert loaded["model"]["default"] == "${GATE_X}", "unexpanded: the reference reads as absent, never as another value"
+    assert getattr(_thread_ctx, "env", None) == previous, "the caller's thread env was not restored"
 
 
 def test_expand_profile_config_restores_the_callers_thread_env(tree):
@@ -309,6 +363,8 @@ _ALLOWED = {
     ("profiles.py", "_profile_secret_env_names"): "reads ${NAME} reference NAMES; expanding destroys them",
     ("config.py", "_declares_model_provider_kind"): "plugin.yaml, not config.yaml",
     ("profiles.py", "_profile_visible_from_meta"): "profile.yaml, not config.yaml",
+    ("gateway_chat.py", "_config_url_may_belong_to_a_profile"): "reads ${VAR} reference NAMES of an operator config file (#8435)",
+    ("gateway_chat.py", "_gateway_endpoint_for_profile"): "value reader: expands under its own explicit profile env (#8435)",
 }
 
 
