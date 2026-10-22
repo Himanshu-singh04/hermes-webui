@@ -2844,8 +2844,7 @@ def _run_gateway_chat_streaming(
     usage = {"input_tokens": 0, "output_tokens": 0, "estimated_cost": 0}
     try:
         s = get_session(session_id)
-        from api.config import get_config_for_profile_home  # imported lazily to avoid config-cycle churn
-        from api.profiles import get_hermes_home_for_profile
+        from api.config import get_config  # imported lazily to avoid config-cycle churn
 
         # Profile-bound like the endpoint below: the worker thread has no request profile TLS.
         cfg = _gateway_config_for_profile(getattr(s, "profile", None)) or get_config()
