@@ -6179,12 +6179,26 @@ def _write_persisted_reasoning_effort(sid, value, identity_source=None, profile=
             # get_session() that read the pre-pick sidecar re-reads instead of
             # publishing the old effort.
             _replace_session_sidecar(tmp, path, sid)
-            # The sidebar projection is built from the sidecar just written,
-            # never from a possibly stale live object (same ordered publish
-            # as save()).
-            index_session = Session(**dict(data))
-            index_session._metadata_message_count = len(index_session.messages or [])
-            _write_session_index(updates=[index_session])
+            # The sidecar replace is the COMMIT point (#8253 review): from here
+            # the pick is on disk and a cold load will restore it, so the
+            # caller must update memory and the baseline whatever happens
+            # below. The sidebar index is a projection that any later save or
+            # a full rebuild regenerates; a failure writing it (ENOSPC, a
+            # permission change) is logged, never raised, so the route cannot
+            # report a failed pick that the next reload quietly applies.
+            try:
+                # Built from the sidecar just written, never from a possibly
+                # stale live object (same ordered publish as save()).
+                index_session = Session(**dict(data))
+                index_session._metadata_message_count = len(index_session.messages or [])
+                _write_session_index(updates=[index_session])
+            except Exception:
+                logger.warning(
+                    "session %s: reasoning effort persisted but the sidebar index "
+                    "write failed; the index will be rebuilt on the next save",
+                    sid,
+                    exc_info=True,
+                )
     except Exception:
         try:
             tmp.unlink(missing_ok=True)

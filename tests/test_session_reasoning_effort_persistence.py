@@ -636,3 +636,38 @@ def test_explicit_pick_equal_to_stale_cached_baseline_is_written(tmp_path, monke
     status, payload = post.post("low", "/api/reasoning", {"effort": "low", "session_id": sid})
     assert status == 200 and payload.get("reasoning_effort") == "low", (status, payload)
     assert _cold_effort(sid) == "low", "the explicit Low pick was answered 200 but not persisted"
+
+
+def test_pick_committed_by_sidecar_replace_survives_an_index_write_failure(tmp_path, monkeypatch):
+    """#8253 review (carlotestor P1): the sidecar replace is the commit point.
+
+    ``_write_persisted_reasoning_effort`` replaced the sidecar and then wrote the
+    sidebar index under the same ``try``; an index failure re-raised AFTER the
+    pick was on disk, so the route reported a failed save, memory kept the old
+    value, and the next cold load quietly applied the "failed" pick. The index
+    is a projection that can be rebuilt; once the sidecar is replaced the pick is
+    committed: log the index failure and let memory, the baseline and the
+    profile write proceed, so cache == disk == the new value.
+    """
+    from api import models
+
+    monkeypatch.setattr(models, "SESSION_DIR", tmp_path)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", tmp_path / "index.json")
+    session = models.Session(session_id="s-idx-fail", title="t")
+    session.reasoning_effort = "low"
+    session.save()
+    with models.LOCK:
+        models.SESSIONS[session.session_id] = session
+
+    def _boom(*a, **k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(models, "_write_session_index", _boom)
+    previous = models.set_session_reasoning_effort(session.session_id, "high")
+    assert previous == "low"
+
+    on_disk = json.loads((tmp_path / "s-idx-fail.json").read_text(encoding="utf-8"))
+    assert on_disk["reasoning_effort"] == "high"
+    assert session.reasoning_effort == "high"
+    assert models.SESSIONS[session.session_id].reasoning_effort == "high"
+    assert getattr(session, "_reasoning_effort_saved", None) == "high"
