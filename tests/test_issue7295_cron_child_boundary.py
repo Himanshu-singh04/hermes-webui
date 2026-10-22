@@ -648,3 +648,95 @@ def pickle_roundtrip(obj):
     import pickle
 
     return pickle.loads(pickle.dumps(obj))
+
+
+_E2E_PROBE = textwrap.dedent(
+    """
+    import json, os, pathlib, sys, threading, time
+
+    root = pathlib.Path(sys.argv[1])
+    sys.path.insert(0, sys.argv[2])
+    sys.path.insert(1, sys.argv[3])
+    home = pathlib.Path(os.environ["HERMES_HOME"])
+    marker = root / "script-ran.json"
+    (home / "scripts" / "probe.py").write_text(
+        "import json, os, time, pathlib\\n"
+        f"pathlib.Path({str(marker)!r}).write_text(json.dumps({{'ppid': os.getppid(), "
+        "'home': os.environ.get('HERMES_HOME')}))\\n"
+        "time.sleep(3)\\nprint('probe-output-ok')\\n", encoding="utf-8")
+
+    from api import profiles as p
+    p.install_cron_scheduler_profile_isolation()
+    from cron.jobs import create_job, get_job
+    from cron.executions import list_executions
+    from tools.cronjob_tools import _claim_for_manual_run, _run_claimed_job
+
+    job = create_job(prompt=None, schedule="every 1h", name="e2e-7295", script="probe.py", no_agent=True)
+    claimed, err = _claim_for_manual_run(job["id"], "e2e")
+    assert err is None, err
+    box = {}
+    # The Agent's background cronjob(action='run') body, on a delegation-pool-named thread.
+    runner = threading.Thread(
+        target=lambda: box.update(res=_run_claimed_job(claimed)), name="async-delegate_0")
+    runner.start()
+    deadline = time.monotonic() + 60
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    started = json.loads(marker.read_text()) if marker.exists() else None
+    entered = threading.Event()
+
+    def _reader():
+        with p.cron_profile_context_for_home(home):
+            entered.set()
+
+    threading.Thread(target=_reader, daemon=True).start()
+    reader_ok = entered.wait(2.0)
+    runner.join(90)
+    rows = list_executions(job_id=job["id"])
+    print("E2E-RESULT " + json.dumps({
+        "started": started, "reader_ok": reader_ok, "parent_pid": os.getpid(),
+        "alive": runner.is_alive(), "res": box.get("res"),
+        "last_status": (get_job(job["id"]) or {}).get("last_status"),
+        "rows": [{"status": r.get("status"), "pid": r.get("pid")} for r in rows],
+        "lock_after": p._cron_env_lock.locked(),
+    }, default=str))
+    """
+)
+
+
+def test_background_delegation_fire_runs_body_in_child_end_to_end(tmp_path):
+    """#7295 end to end against the real Agent: the async-delegate ``_run_claimed_job`` body
+    (claim -> run_one_job -> run_job) runs its script in the profile-pinned child, the parent
+    stays lock-free, and the parent-owned lifecycle (ledger row, status) completes."""
+    import subprocess as sp
+
+    pytest.importorskip("cron.scheduler")
+    pytest.importorskip("tools.cronjob_tools")
+    pytest.importorskip("cron.executions")
+    from conftest import _discover_agent_dir
+
+    agent_dir = _discover_agent_dir()
+    repo_root = Path(__file__).resolve().parent.parent
+    home = tmp_path / "home"
+    (home / "cron").mkdir(parents=True)
+    (home / "scripts").mkdir()
+    probe = tmp_path / "probe_main.py"
+    probe.write_text(_E2E_PROBE, encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_")}
+    env.update(HERMES_HOME=str(home), HERMES_WEBUI_STATE_DIR=str(tmp_path / "state"),
+               HERMES_CRON_SCRIPT_TIMEOUT="60", TMPDIR=str(tmp_path))
+    proc = sp.run([sys.executable, str(probe), str(tmp_path), str(repo_root), str(agent_dir)],
+                  env=env, capture_output=True, text=True, timeout=180)
+    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("E2E-RESULT ")), None)
+    assert line, f"probe failed rc={proc.returncode}\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+    out = json.loads(line[len("E2E-RESULT "):])
+    assert out["started"], "script never ran"
+    assert out["started"]["home"] == str(home)
+    assert out["started"]["ppid"] != out["parent_pid"], "job body ran in the WebUI parent"
+    assert out["reader_ok"], "cron reader blocked while the background fire's body ran"
+    assert not out["alive"]
+    assert out["res"] == {"claimed": True, "success": True, "error": None}
+    assert out["last_status"] == "ok"
+    assert [r["status"] for r in out["rows"]] == ["completed"]
+    assert out["rows"][0]["pid"] == out["parent_pid"], "ledger row not owned by the parent"
+    assert out["lock_after"] is False
