@@ -26,6 +26,37 @@ Transport (POSIX only; other platforms fall back to the legacy in-process path):
 * a private control pipe carries cancellation (one byte) and, by EOF, parent
   death: the child kills its process group when the parent goes away, so a
   WebUI crash or restart ends the job body exactly as an in-process run would.
+
+What crosses the boundary (and what deliberately does not):
+
+* The child environment is the parent's ``os.environ`` with ``HERMES_HOME``
+  pinned and the per-turn markers WebUI mirrors process-wide during a chat turn
+  (human-presence flags such as ``HERMES_EXEC_ASK`` and ``HERMES_SESSION_*``
+  identity) removed -- the same unattended-worker hygiene the Agent applies to
+  its own restart-safe cron worker.  A child spawned while a chat turn streams
+  therefore never inherits that turn's identity or approval mode.
+* The Agent's per-fire ContextVars (execution identity, secret scope, terminal
+  policy, multiplex semantics) are re-installed in the child for its pinned home
+  with the Agent's own helpers -- only the ones active in the parent.  Secret
+  VALUES are never pickled: the child rebuilds the scope from the profile's own
+  sources.  If the parent has an active scope the installed Agent cannot rebuild
+  in the child, the call stays in-process (``ChildBoundaryUnavailable``) rather
+  than run a body whose unscoped secret reads would fall back to the launch
+  process environment.
+* A gateway cron owner execution bound in this process (``gateway.session_cron``)
+  is not transferable, so such a call stays in-process too; otherwise the child
+  would resubmit the fire to the gateway instead of running it locally.  WebUI
+  never binds one itself.
+
+Timeouts: Agent jobs normally declare no wall-clock timeout, and the parent adds
+none for them (matching the in-process path).  The effective limits remain the
+Agent's own -- the agent turn's inactivity watchdog (``HERMES_CRON_TIMEOUT``,
+idle-based, default 600s) wherever the turn runs, the script timeout for
+``no_agent`` jobs, and the parent-side fire-claim heartbeat / stale-claim sweep
+that ``run_one_job`` keeps owning.  Parent cancellation (claim lost, transport
+cancel) is forwarded and enforced with a kill after
+``CHILD_CANCEL_GRACE_SECONDS``.  ``job_timeout_seconds`` is only a backstop for
+jobs that DO declare a timeout.
 """
 from __future__ import annotations
 
@@ -144,23 +175,153 @@ def _current_cron_execution():
         return None
 
 
-def _snapshot_fire_context() -> dict:
-    """Launch inputs the child needs to rebuild the Agent's per-fire scopes.
+# Agent APIs the child uses to rebuild each per-fire scope, keyed by scope.
+# Resolved by name so WebUI keeps working against older Agents, and pinned by a
+# contract test against the installed Agent so a rename cannot silently drop a
+# scope (see ``missing_fire_context_apis``).
+FIRE_CONTEXT_APIS = {
+    "identity": (("cron.execution_identity", "_CURRENT"),),
+    "secret_scope": (
+        ("cron.scheduler", "_install_fire_secret_scope"),
+        ("cron.scheduler", "_reset_fire_secret_scope"),
+    ),
+    "terminal_scope": (
+        ("tools.terminal_scope", "install_profile_terminal_scope"),
+        ("tools.terminal_scope", "reset_terminal_scope"),
+    ),
+    "multiplex_context": (
+        ("agent.secret_scope", "set_multiplex_context"),
+        ("agent.secret_scope", "reset_multiplex_context"),
+        ("agent.secret_scope", "is_multiplex_active"),
+    ),
+    "multiplex_process": (("agent.secret_scope", "set_multiplex_active"),),
+    "routing_home": (("hermes_constants", "pin_process_hermes_home"),),
+    "progress": (("cron.executions", "touch_execution_progress"),),
+}
 
-    ``run_one_job`` binds the fire's identity, secret scope and terminal policy
-    as ContextVars before it calls ``run_job``.  ContextVars do not cross a
-    process boundary, so the child re-installs them for its pinned home with
-    the Agent's own helpers (each guarded so older Agents simply skip it).
+
+def missing_fire_context_apis(scopes=None, *, import_missing: bool = True) -> list[str]:
+    """``module.name`` entries of FIRE_CONTEXT_APIS absent from the installed Agent."""
+    missing = []
+    for scope in (FIRE_CONTEXT_APIS if scopes is None else scopes):
+        for module_name, attr in FIRE_CONTEXT_APIS[scope]:
+            module = sys.modules.get(module_name)
+            if module is None and import_missing:
+                try:
+                    module = importlib.import_module(module_name)
+                except Exception:
+                    module = None
+            if module is None or getattr(module, attr, None) is None:
+                missing.append(f"{module_name}.{attr}")
+    return missing
+
+
+def _loaded_attr(module_name: str, attr: str):
+    module = sys.modules.get(module_name)
+    return getattr(module, attr, None) if module is not None else None
+
+
+def _call_quietly(fn, default=None):
+    if not callable(fn):
+        return default
+    try:
+        return fn()
+    except Exception:
+        return default
+
+
+def _snapshot_fire_context() -> dict:
+    """Which of the Agent's per-fire scopes are active here, for the child to rebuild.
+
+    ``run_one_job`` binds the fire's identity, secret scope, terminal policy and
+    (for a routed fire) multiplex semantics as ContextVars before it calls
+    ``run_job``.  ContextVars do not cross a process boundary, so the child
+    re-installs each scope that is active here, for its pinned home, with the
+    Agent's own helpers.  Only flags and the frozen identity record cross: the
+    child rebuilds secret and terminal scopes from the profile's own sources.
+
+    Raises ChildBoundaryUnavailable when an active scope could not be rebuilt
+    by the installed Agent, so the caller keeps the in-process path instead of
+    running the body without it.
     """
     identity = _current_cron_execution()
-    snapshot = {"owned_fire": identity is not None}
+    secret_scope = _call_quietly(_loaded_attr("agent.secret_scope", "current_secret_scope"))
+    terminal_scope = _call_quietly(_loaded_attr("tools.terminal_scope", "get_terminal_scope"))
+    multiplex_var = _loaded_attr("agent.secret_scope", "_MULTIPLEX_CONTEXT")
+    snapshot = {
+        "owned_fire": identity is not None,
+        "secret_scope": secret_scope is not None,
+        "terminal_scope": terminal_scope is not None,
+        "multiplex_context": bool(_call_quietly(getattr(multiplex_var, "get", None), False)),
+        "multiplex_process": bool(_loaded_attr("agent.secret_scope", "_MULTIPLEX_ACTIVE")),
+    }
     if identity is not None:
         try:
-            pickle.dumps(identity)
-            snapshot["identity"] = identity
-        except Exception:
-            logger.debug("cron child: execution identity is not transferable", exc_info=True)
+            pickle.loads(pickle.dumps(identity))
+        except Exception as exc:
+            raise ChildBoundaryUnavailable(f"cron execution identity is not transferable: {exc}") from exc
+        snapshot["identity"] = identity
+    needed = [scope for scope in ("secret_scope", "terminal_scope", "multiplex_context",
+                                  "multiplex_process") if snapshot[scope]]
+    missing = missing_fire_context_apis(needed)
+    if missing:
+        raise ChildBoundaryUnavailable(
+            "the installed Agent cannot rebuild this fire's active scopes in a child "
+            f"(missing {', '.join(missing)})")
     return snapshot
+
+
+def _gateway_owner_bound(job, home) -> bool:
+    """True when this process is the gateway cron owner for the fire or its home.
+
+    ``cron.scheduler.run_job`` runs a bound owner execution locally and submits
+    everything else to the profile's gateway; the binding is process-local, so
+    it cannot follow the job into a child.
+    """
+    current = _call_quietly(_loaded_attr("gateway.session_cron", "current_execution"))
+    if current is not None:
+        return True
+    owner_for_home = _loaded_attr("gateway.session_cron", "owner_for_home")
+    if callable(owner_for_home):
+        try:
+            return owner_for_home(home) is not None
+        except Exception:
+            return False
+    return False
+
+
+# Per-turn markers WebUI mirrors into the process environment while a chat turn
+# streams.  An unattended job body must not inherit them (the Agent strips the
+# same presence markers from its own restart-safe cron worker).
+_CHILD_STRIPPED_ENV = (
+    "HERMES_INTERACTIVE",
+    "HERMES_GATEWAY_SESSION",
+    "HERMES_EXEC_ASK",
+    "HERMES_SINGLE_QUERY_SESSION",
+    "HERMES_UI_SESSION_ID",
+    "HERMES_CRON_SESSION",
+    "HERMES_CRON_AUTO_DELIVER_PLATFORM",
+    "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
+    "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
+)
+_CHILD_STRIPPED_ENV_PREFIXES = ("HERMES_SESSION_",)
+
+
+def _child_env(home: Path) -> dict:
+    for _attempt in range(5):
+        try:
+            items = list(os.environ.items())
+            break
+        except RuntimeError:  # another thread resized os.environ mid-copy
+            continue
+    else:
+        items = list(os.environ.copy().items())
+    env = {
+        key: value for key, value in items
+        if key not in _CHILD_STRIPPED_ENV and not key.startswith(_CHILD_STRIPPED_ENV_PREFIXES)
+    }
+    env["HERMES_HOME"] = str(home)
+    return env
 
 
 def _routing_process_home():
@@ -221,6 +382,9 @@ class JobChild:
         self.job = job
         self.home = Path(home)
         self.timeout = timeout
+        if _gateway_owner_bound(job, self.home):
+            raise ChildBoundaryUnavailable(
+                "this process holds the gateway cron owner execution for the fire")
         payload = {
             "target": _callable_target(fn),
             "home": str(self.home),
@@ -251,8 +415,7 @@ class JobChild:
         try:
             result_r, result_w = os.pipe()
             control_r, control_w = os.pipe()
-            env = dict(os.environ)
-            env["HERMES_HOME"] = str(self.home)
+            env = _child_env(self.home)
             env["HERMES_WEBUI_CRON_CHILD_FDS"] = f"{result_w},{control_r}"
             self.process = subprocess.Popen(
                 [sys.executable, *_interpreter_flags(), "-c", _BOOTSTRAP],
@@ -319,10 +482,9 @@ class JobChild:
                     return frame
                 frame = self._next_frame()
             if eof:
-                try:
-                    code = self.process.wait(timeout=CHILD_TERMINATE_GRACE_SECONDS)
-                except subprocess.TimeoutExpired:
-                    code = "unknown (still running)"
+                exited = self._wait_leader_exit(CHILD_TERMINATE_GRACE_SECONDS)
+                self._sweep_group_and_reap()
+                code = getattr(self.process, "returncode", None) if exited else "unknown (still running)"
                 raise RuntimeError(
                     f"cron job child exited with code {code} before returning a result")
             self._check_cancel_and_deadline(deadline)
@@ -365,8 +527,37 @@ class JobChild:
             raise RuntimeError(
                 f"cron job child timed out after {float(self.timeout or 0):g}s and was killed")
 
+    # Process-group signalling is only safe while the group id is pinned: the
+    # leader (pid == pgid) is alive or an unreaped zombie.  Once it is reaped
+    # and its group empties, the id can be recycled by an unrelated process, so
+    # the leader is never reaped before the final group sweep.
+    def _leader_reaped(self) -> bool:
+        return self.process is None or self.process.returncode is not None
+
+    def _wait_leader_exit(self, timeout: float) -> bool:
+        """Wait up to *timeout* for the leader to exit WITHOUT reaping it."""
+        process = self.process
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            if process is None or process.returncode is not None:
+                return True
+            try:
+                exited = os.waitid(os.P_PID, process.pid,
+                                   os.WEXITED | os.WNOWAIT | os.WNOHANG) is not None
+            except ChildProcessError:
+                # Reaped behind our back; Popen learns the status lazily.
+                process.poll()
+                return True
+            except (AttributeError, OSError):
+                exited = process.poll() is not None  # no waitid: best effort
+            if exited:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
     def _signal_group(self, sig) -> None:
-        if self.process is None:
+        if self.process is None or self._leader_reaped():
             return
         try:
             os.killpg(self.process.pid, sig)
@@ -375,22 +566,25 @@ class JobChild:
         except OSError:
             logger.debug("cron child killpg(%s) failed", sig, exc_info=True)
 
-    def _kill(self) -> None:
+    def _sweep_group_and_reap(self) -> None:
+        """SIGKILL whatever is left in the group (descendants included), then reap."""
         process = self.process
         if process is None:
             return
-        if process.poll() is None:
-            self._signal_group(signal.SIGTERM)
-            try:
-                process.wait(timeout=CHILD_TERMINATE_GRACE_SECONDS)
-            except subprocess.TimeoutExpired:
-                pass
-        # Always sweep the group: descendants may outlive the leader.
         self._signal_group(signal.SIGKILL)
         try:
             process.wait(timeout=CHILD_TERMINATE_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
             logger.warning("cron job child pid=%s did not exit after SIGKILL", process.pid)
+
+    def _kill(self) -> None:
+        if self.process is None:
+            return
+        if not self._wait_leader_exit(0):
+            self._signal_group(signal.SIGTERM)
+            self._wait_leader_exit(CHILD_TERMINATE_GRACE_SECONDS)
+        # Always sweep the group: descendants may outlive the leader.
+        self._sweep_group_and_reap()
 
     def _close(self) -> None:
         selector = getattr(self, "_selector", None)
@@ -412,16 +606,14 @@ class JobChild:
     def _reap_in_background(self) -> None:
         def _reap():
             try:
-                try:
-                    self.process.wait(timeout=CHILD_EXIT_GRACE_SECONDS)
-                except subprocess.TimeoutExpired:
+                if self._wait_leader_exit(CHILD_EXIT_GRACE_SECONDS):
+                    # The leader exited; sweep any descendants it left in its group.
+                    self._sweep_group_and_reap()
+                else:
                     logger.warning(
                         "cron job child pid=%s still running %.0fs after returning its result; killing it",
                         self.process.pid, CHILD_EXIT_GRACE_SECONDS)
                     self._kill()
-                else:
-                    # The leader exited; sweep any descendants it left in its group.
-                    self._signal_group(signal.SIGKILL)
             finally:
                 self._close()
 
@@ -541,34 +733,60 @@ def _install_progress_relay(channel: _ChildChannel) -> None:
 
 
 def _install_fire_context(fire_context: dict, home: Path) -> list:
-    """Re-install the Agent's per-fire ContextVars for the pinned home."""
+    """Re-install, for the pinned home, each per-fire scope active in the parent.
+
+    The parent already refused the boundary when an active scope had no Agent
+    helper (``_snapshot_fire_context``), so a helper missing HERE means the
+    Agent changed on disk mid-launch: fail closed instead of running the body
+    with unscoped secret reads.
+    """
     resets = []
-    if not fire_context.get("owned_fire"):
-        return resets
+
+    def _require(scope):
+        missing = missing_fire_context_apis([scope])
+        if missing:
+            raise RuntimeError(
+                f"cron child cannot rebuild the fire's {scope} (missing {', '.join(missing)})")
+
+    if fire_context.get("multiplex_process"):
+        _require("multiplex_process")
+        importlib.import_module("agent.secret_scope").set_multiplex_active(True)
     identity = fire_context.get("identity")
     if identity is not None:
+        _require("identity")
+        var = importlib.import_module("cron.execution_identity")._CURRENT
+        identity_token = var.set(identity)
+        resets.append(lambda: var.reset(identity_token))
+    if fire_context.get("secret_scope") or fire_context.get("owned_fire"):
+        if fire_context.get("secret_scope"):
+            _require("secret_scope")
+        scheduler = importlib.import_module("cron.scheduler")
+        install_scope = getattr(scheduler, "_install_fire_secret_scope", None)
+        reset_scope = getattr(scheduler, "_reset_fire_secret_scope", None)
+        if callable(install_scope) and callable(reset_scope):
+            scope_tokens = install_scope()
+            resets.append(lambda: reset_scope(scope_tokens))
+    if fire_context.get("multiplex_context"):
+        # The fire scope re-derives routed-fire multiplexing from the pinned
+        # launch home; mirror the parent's flag too so a fail-closed parent
+        # never becomes a permissive child.
+        _require("multiplex_context")
+        secret_scope = importlib.import_module("agent.secret_scope")
+        if not secret_scope.is_multiplex_active():
+            multiplex_token = secret_scope.set_multiplex_context(True)
+            resets.append(lambda: secret_scope.reset_multiplex_context(multiplex_token))
+    if fire_context.get("terminal_scope") or fire_context.get("owned_fire"):
+        if fire_context.get("terminal_scope"):
+            _require("terminal_scope")
         try:
-            execution_identity = importlib.import_module("cron.execution_identity")
-            var = getattr(execution_identity, "_CURRENT")
-            token = var.set(identity)
-            resets.append(lambda: var.reset(token))
+            terminal_scope = importlib.import_module("tools.terminal_scope")
         except Exception:
-            logger.debug("cron child: could not bind execution identity", exc_info=True)
-    scheduler = importlib.import_module("cron.scheduler")
-    install_scope = getattr(scheduler, "_install_fire_secret_scope", None)
-    reset_scope = getattr(scheduler, "_reset_fire_secret_scope", None)
-    if callable(install_scope) and callable(reset_scope):
-        tokens = install_scope()
-        resets.append(lambda: reset_scope(tokens))
-    try:
-        terminal_scope = importlib.import_module("tools.terminal_scope")
-    except Exception:
-        terminal_scope = None
-    install_terminal = getattr(terminal_scope, "install_profile_terminal_scope", None)
-    reset_terminal = getattr(terminal_scope, "reset_terminal_scope", None)
-    if callable(install_terminal) and callable(reset_terminal):
-        terminal_token = install_terminal(home)
-        resets.append(lambda: reset_terminal(terminal_token))
+            terminal_scope = None
+        install_terminal = getattr(terminal_scope, "install_profile_terminal_scope", None)
+        reset_terminal = getattr(terminal_scope, "reset_terminal_scope", None)
+        if callable(install_terminal) and callable(reset_terminal):
+            terminal_token = install_terminal(home)
+            resets.append(lambda: reset_terminal(terminal_token))
     return resets
 
 

@@ -67,9 +67,10 @@ FAKE_SOURCE = textwrap.dedent(
             "execution_id": execution_id,
             "has_cancel": cancel_event is not None,
             "has_defer": defer_agent_teardown is not None,
+            "env": {k: os.environ.get(k) for k in job.get("env_probe", ())},
         }
         mode = job.get("mode", "wait")
-        if mode == "ignore_cancel":
+        if mode == "ignore_cancel" or job.get("spawn_grandchild"):
             grandchild = subprocess.Popen(
                 [sys.executable, "-c", "import time; time.sleep(120)"])
             info["grandchild_pid"] = grandchild.pid
@@ -424,11 +425,15 @@ def test_job_timeout_kills_child(harness, monkeypatch):
     monkeypatch.setattr(cron_child, "CHILD_TIMEOUT_GRACE_SECONDS", 0.0)
     monkeypatch.setattr(cron_child, "CHILD_TIMEOUT_FLOOR_SECONDS", 0.0)
     monkeypatch.setattr(cron_child, "CHILD_TERMINATE_GRACE_SECONDS", 1.0)
+    # The backstop counts from spawn, and a child imports the real Agent
+    # cron.scheduler (~2s on a loaded host) before the body starts: leave
+    # enough room for startup so the kill lands mid-body, not mid-import.
     job, ctl = harness.job(
-        "timeout", mode="ignore_cancel", profile="research", max_wait=60, timeout_seconds=2)
+        "timeout", mode="ignore_cancel", profile="research", max_wait=60, timeout_seconds=12)
     thread, box = harness.run_in_thread(job)
     info = _wait_for(ctl / "started")
-    thread.join(30)
+    assert thread.is_alive(), "backstop fired before the job body was observed running"
+    thread.join(45)
     assert not thread.is_alive()
     assert isinstance(box.get("error"), RuntimeError), box
     assert "timed out" in str(box["error"]).lower() or "timeout" in str(box["error"]).lower()
@@ -509,3 +514,137 @@ def _orphan_harness_main(tmp_root, ctl):  # pragma: no cover - runs in forked pr
         h.cron_scheduler.run_job(job)
     finally:
         os._exit(0)
+
+
+def test_child_env_drops_per_turn_chat_markers(harness, monkeypatch):
+    """A child spawned while a chat turn streams must not inherit that turn's markers."""
+    for key, value in (
+        ("HERMES_EXEC_ASK", "1"),
+        ("HERMES_INTERACTIVE", "1"),
+        ("HERMES_GATEWAY_SESSION", "1"),
+        ("HERMES_SESSION_KEY", "chat-key"),
+        ("HERMES_SESSION_PLATFORM", "webui"),
+        ("WT7295_KEEP", "kept"),
+    ):
+        monkeypatch.setenv(key, value)
+    probe = ("HERMES_EXEC_ASK", "HERMES_INTERACTIVE", "HERMES_GATEWAY_SESSION",
+             "HERMES_SESSION_KEY", "HERMES_SESSION_PLATFORM", "WT7295_KEEP")
+    job, ctl = harness.job("env", profile="research", env_probe=probe)
+    (ctl / "release").write_text("go")
+    harness.cron_scheduler.run_job(job)
+    info = _wait_for(ctl / "started")
+    assert info["pid"] != os.getpid()
+    assert info["env"] == {
+        "HERMES_EXEC_ASK": None, "HERMES_INTERACTIVE": None, "HERMES_GATEWAY_SESSION": None,
+        "HERMES_SESSION_KEY": None, "HERMES_SESSION_PLATFORM": None, "WT7295_KEEP": "kept",
+    }
+    # The parent's own environment is untouched.
+    assert os.environ["HERMES_EXEC_ASK"] == "1"
+
+
+def test_bound_gateway_owner_execution_stays_in_process(harness, monkeypatch):
+    """A process-local gateway owner binding cannot follow the fire into a child."""
+    job, ctl = harness.job("owner", profile="research")
+    session_cron = types.ModuleType("gateway.session_cron")
+    session_cron.current_execution = lambda: ("authority", "sid", job["id"], "exec-o")
+    session_cron.owner_for_home = lambda home: None
+    monkeypatch.setitem(sys.modules, "gateway.session_cron", session_cron)
+    (ctl / "release").write_text("go")
+    result = harness.cron_scheduler.run_job(job, execution_id="exec-o")
+    info = _wait_for(ctl / "started")
+    assert info["pid"] == os.getpid(), "owner-bound fire was moved into a child"
+    assert info["home"] == str(harness.research_home)
+    assert result[0] is True
+
+
+def test_active_scope_the_agent_cannot_rebuild_stays_in_process(harness, monkeypatch):
+    """Never run a child without a secret scope the parent had active."""
+    secret_scope = types.ModuleType("agent.secret_scope")
+    secret_scope.current_secret_scope = lambda: {"API_KEY": "scoped"}
+    monkeypatch.setitem(sys.modules, "agent.secret_scope", secret_scope)
+    # The harness's fake cron.scheduler has no _install_fire_secret_scope.
+    job, ctl = harness.job("scope", profile="research")
+    (ctl / "release").write_text("go")
+    result = harness.cron_scheduler.run_job(job)
+    info = _wait_for(ctl / "started")
+    assert info["pid"] == os.getpid(), "child ran without the parent's active secret scope"
+    assert result[0] is True
+
+
+def test_child_fails_closed_when_scope_helper_vanishes(monkeypatch):
+    from api import cron_child
+
+    monkeypatch.setitem(sys.modules, "cron.scheduler", types.ModuleType("cron.scheduler"))
+    with pytest.raises(RuntimeError, match="secret_scope"):
+        cron_child._install_fire_context({"secret_scope": True}, Path("/nonexistent-home"))
+
+
+def test_descendants_left_after_a_normal_return_are_swept(harness):
+    job, ctl = harness.job("leftover", profile="research", spawn_grandchild=True)
+    (ctl / "release").write_text("go")
+    result = harness.cron_scheduler.run_job(job)
+    info = _wait_for(ctl / "started")
+    assert result[0] is True
+    assert _pid_gone(info["pid"], timeout=15)
+    assert _pid_gone(info["grandchild_pid"], timeout=15), "child's leftover descendant survived"
+
+
+def test_fire_context_contract_matches_installed_agent(tmp_path):
+    """Pin every Agent API the child uses to rebuild per-fire scopes (version skew guard).
+
+    Skips only when no Agent is importable; with an Agent present a renamed or
+    removed helper fails here instead of silently dropping a scope in the child.
+    """
+    import dataclasses
+    import inspect
+
+    scheduler = pytest.importorskip("cron.scheduler")
+    from api import cron_child
+    from api import profiles as p
+
+    assert cron_child.missing_fire_context_apis() == []
+    execution_identity = importlib.import_module("cron.execution_identity")
+    terminal_scope = importlib.import_module("tools.terminal_scope")
+    secret_scope = importlib.import_module("agent.secret_scope")
+    hermes_constants = importlib.import_module("hermes_constants")
+    inspect.signature(scheduler._install_fire_secret_scope).bind()
+    inspect.signature(scheduler._reset_fire_secret_scope).bind(object())
+    inspect.signature(terminal_scope.install_profile_terminal_scope).bind(tmp_path)
+    inspect.signature(terminal_scope.reset_terminal_scope).bind(object())
+    inspect.signature(hermes_constants.pin_process_hermes_home).bind(str(tmp_path))
+    inspect.signature(hermes_constants.get_routing_process_hermes_home).bind()
+    for name in ("current_secret_scope", "current_secret_scope_home"):
+        inspect.signature(getattr(secret_scope, name)).bind()
+    inspect.signature(terminal_scope.get_terminal_scope).bind()
+    session_cron = importlib.import_module("gateway.session_cron")
+    inspect.signature(session_cron.current_execution).bind()
+    inspect.signature(session_cron.owner_for_home).bind(tmp_path)
+
+    identity_cls = execution_identity.CronExecution
+    identity = identity_cls(**{f.name: "x" for f in dataclasses.fields(identity_cls)})
+    assert pickle_roundtrip(identity) == identity
+
+    home = tmp_path / "home"
+    (home / "cron").mkdir(parents=True)
+    fire = {"owned_fire": True, "identity": identity, "secret_scope": True,
+            "terminal_scope": True, "multiplex_context": True}
+    with p.cron_profile_context_for_home(home):
+        resets = cron_child._install_fire_context(fire, home)
+        try:
+            assert execution_identity._CURRENT.get() == identity
+            assert secret_scope.current_secret_scope() is not None
+            assert Path(secret_scope.current_secret_scope_home()).resolve() == home.resolve()
+            assert secret_scope.is_multiplex_active()
+            assert terminal_scope.get_terminal_scope() is not None
+        finally:
+            for reset in reversed(resets):
+                reset()
+    assert execution_identity._CURRENT.get() is None
+    assert secret_scope.current_secret_scope() is None
+    assert terminal_scope.get_terminal_scope() is None
+
+
+def pickle_roundtrip(obj):
+    import pickle
+
+    return pickle.loads(pickle.dumps(obj))
