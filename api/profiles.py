@@ -670,6 +670,56 @@ def _touch_execution_progress_in_parent(execution_id: str) -> None:
         touch(execution_id)
 
 
+def _hermes_constants_module():
+    try:
+        import hermes_constants
+    except ImportError:
+        return None
+    return hermes_constants
+
+
+def _cron_ledger_home(home: Path) -> Path:
+    """The ledger home ``cron.executions`` resolves for this fire's body.
+
+    The in-process path ran the body under ``cron_profile_context_for_home(home)``,
+    where a context-local ``HERMES_HOME`` override bound on this thread still
+    wins (``hermes_constants.get_hermes_home``), else the pinned job home.
+    Captured once, before the child starts, so later relays do not depend on
+    whatever a concurrent ``/api/crons`` reader pins in ``os.environ``.
+    """
+    hc = _hermes_constants_module()
+    get_override = getattr(hc, 'get_hermes_home_override', None) if hc is not None else None
+    if callable(get_override):
+        try:
+            override = get_override()
+        except Exception:
+            override = None
+        if override:
+            return Path(override)
+    return Path(home)
+
+
+def _touch_execution_progress_for_home(execution_id: str, ledger_home: Path) -> None:
+    """Relay a child's progress stamp into *ledger_home*'s ledger, lock-free.
+
+    A context-local home override pins the resolution for this call only; an
+    Agent without one gets the brief cron context instead (lock held only for
+    the single ledger UPDATE).
+    """
+    hc = _hermes_constants_module()
+    set_override = getattr(hc, 'set_hermes_home_override', None) if hc is not None else None
+    reset_override = getattr(hc, 'reset_hermes_home_override', None) if hc is not None else None
+    if callable(set_override) and callable(reset_override):
+        token = set_override(str(ledger_home))
+        try:
+            _touch_execution_progress_in_parent(execution_id)
+        finally:
+            reset_override(token)
+        return
+    with cron_profile_context_for_home(ledger_home):
+        _touch_execution_progress_in_parent(execution_id)
+
+
 def _run_job_in_process_legacy(original, job, args, kwargs, nested: bool):
     """Pre-#7295 behavior, used only when the child boundary is unavailable."""
     if nested:
@@ -738,9 +788,13 @@ def install_cron_scheduler_profile_isolation() -> None:
             )
 
         if not nested:
+            ledger_home = _cron_ledger_home(home)
             return _finish_scheduled_run(
                 job, nested,
-                lambda: child.wait(on_progress=_touch_execution_progress_in_parent),
+                lambda: child.wait(
+                    on_progress=lambda execution_id: _touch_execution_progress_for_home(
+                        execution_id, ledger_home),
+                ),
             )
 
         with _suspended_cron_profile_context() as run_in_outer_context:

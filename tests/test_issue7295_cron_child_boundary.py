@@ -177,7 +177,14 @@ class _Harness:
         cron_executions = types.ModuleType("cron.executions")
 
         def _record_progress(execution_id):
-            self.progress_calls.append((execution_id, os.getpid(), threading.get_ident()))
+            # Same resolution cron.executions._connect() uses for its ledger path.
+            try:
+                from hermes_constants import get_hermes_home
+                ledger_home = str(get_hermes_home())
+            except ImportError:
+                ledger_home = os.environ.get("HERMES_HOME")
+            self.progress_calls.append(
+                (execution_id, os.getpid(), threading.get_ident(), ledger_home))
             return True
 
         cron_executions.touch_execution_progress = _record_progress
@@ -490,6 +497,7 @@ def test_child_progress_stamps_are_relayed_to_owning_parent(harness):
         pytest.skip("Agent cron.executions is not importable in the child (agent-free CI)")
     assert info["progress_returned"] is True
     assert [call[:2] for call in harness.progress_calls] == [("exec-progress", os.getpid())]
+    assert harness.progress_calls[0][3] == str(harness.research_home)
 
 
 @requires_fork
@@ -605,6 +613,44 @@ def test_descendants_left_after_a_normal_return_are_swept(harness):
     assert result[0] is True
     assert _pid_gone(info["pid"], timeout=15)
     assert _pid_gone(info["grandchild_pid"], timeout=15), "child's leftover descendant survived"
+
+
+def test_progress_relay_writes_the_owning_ledger_while_a_reader_switches_home(harness):
+    """A /api/crons reader pinning another profile must not redirect relayed stamps.
+
+    The non-nested path holds no cron context, so a progress stamp resolved from
+    the live ``HERMES_HOME`` would land in whichever profile a concurrent reader
+    pinned -- and the owner's row would look stale to the Agent's recovery.
+    """
+    pytest.importorskip("hermes_constants")
+    job, ctl = harness.job("progress-race", mode="progress", profile="research")
+    (ctl / "release").write_text("go")
+    reader_in = threading.Event()
+    reader_release = threading.Event()
+
+    def _reader():
+        with harness.p.cron_profile_context_for_home(harness.ops_home):
+            reader_in.set()
+            reader_release.wait(60)
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
+    try:
+        assert reader_in.wait(5)
+        assert os.environ["HERMES_HOME"] == str(harness.ops_home)
+        thread, box = harness.run_in_thread(job, execution_id="exec-race")
+        thread.join(60)
+        assert not thread.is_alive(), "relay blocked behind the reader's cron context"
+    finally:
+        reader_release.set()
+        reader.join(10)
+    assert "error" not in box, box.get("error")
+    info = _wait_for(ctl / "started")
+    if info["progress_returned"] == "unavailable":
+        pytest.skip("Agent cron.executions is not importable in the child (agent-free CI)")
+    assert [(c[0], c[3]) for c in harness.progress_calls] == [
+        ("exec-race", str(harness.research_home))], (
+        "relayed progress stamp resolved another profile's ledger home")
 
 
 def test_launch_profile_secret_scope_uses_the_parents_frozen_launch_env(harness, monkeypatch):
@@ -726,6 +772,9 @@ def test_fire_context_contract_matches_installed_agent(tmp_path):
     policy = importlib.import_module(cron_child._LAUNCH_ENV_MODULE)
     assert all(hasattr(policy, attr) for attr in cron_child._LAUNCH_ENV_ATTRS)
     inspect.signature(policy.capture_launch_env).bind()
+    inspect.signature(hermes_constants.set_hermes_home_override).bind(str(tmp_path))
+    inspect.signature(hermes_constants.reset_hermes_home_override).bind(object())
+    inspect.signature(hermes_constants.get_hermes_home_override).bind()
     inspect.signature(session_cron.owner_for_home).bind(tmp_path)
 
     identity_cls = execution_identity.CronExecution
