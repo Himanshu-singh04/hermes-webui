@@ -494,8 +494,16 @@ def kill_process_tree(root: int) -> int:
     current = _process_table()
     killed = 0
     for pid, start in frozen.items():
-        if current is not None and current.get(pid, (None, None))[1] != start:
-            continue  # exited (or the pid was recycled) since it was frozen
+        entry = None if current is None else current.get(pid)
+        if current is not None and (entry is None or entry[1] != start):
+            if entry is not None:
+                # The pid was recycled between the scan and SIGSTOP: that
+                # process is not ours, so undo the stop instead of killing it.
+                try:
+                    os.kill(pid, signal.SIGCONT)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            continue
         try:
             os.kill(pid, signal.SIGKILL)
             killed += 1
