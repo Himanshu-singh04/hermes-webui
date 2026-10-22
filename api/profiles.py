@@ -662,14 +662,42 @@ def _home_for_scheduled_cron_job(job: dict) -> Path:
     return home
 
 
-def install_cron_scheduler_profile_isolation() -> None:
-    """Patch cron.scheduler.run_job for WebUI in-process scheduler safety.
+def _touch_execution_progress_in_parent(execution_id: str) -> None:
+    """Write a child-relayed ledger progress stamp from the owning parent."""
+    executions = sys.modules.get('cron.executions')
+    touch = getattr(executions, 'touch_execution_progress', None) if executions is not None else None
+    if callable(touch):
+        touch(execution_id)
 
-    Standard WebUI deployments do not start the scheduler thread in-process, but
-    if a future/single-process deployment calls cron.scheduler.tick() from the
-    WebUI worker, tick's background job path has no request TLS context. Wrap
-    run_job so each auto-fired job's persisted ``profile`` field gets the same
-    HERMES_HOME isolation as the manual /api/crons/run path.
+
+def _run_job_in_process_legacy(original, job, args, kwargs, nested: bool):
+    """Pre-#7295 behavior, used only when the child boundary is unavailable."""
+    if nested:
+        return original(job, *args, **kwargs)
+    with cron_profile_context_for_home(_home_for_scheduled_cron_job(job)):
+        return original(job, *args, **kwargs)
+
+
+def install_cron_scheduler_profile_isolation() -> None:
+    """Patch cron.scheduler.run_job so job bodies run behind a profile-pinned child.
+
+    Every caller that reaches ``run_job`` inside this process -- the Agent's
+    fire-claim lifecycle (``run_one_job``) on a background delegation thread
+    (#7295), the in-chat ``cronjob(action='run')`` tool inside the streaming
+    profile context (#6753), or an in-process ``tick()`` -- gets the job body
+    executed in a child interpreter pinned to the job's profile home.  The
+    parent keeps the Agent lifecycle (claim, heartbeat, ledger, save, delivery,
+    bookkeeping) and never holds ``_cron_env_lock`` while the body runs:
+
+    * non-nested calls pin nothing in the parent at all (``HERMES_HOME`` is
+      handed to the child through its environment);
+    * nested calls (already inside a WebUI cron context on this thread) keep
+      that context's home, restore every process-global the context mutated,
+      release the lock while the child runs, and re-enter the context before
+      the caller's bookkeeping resumes.
+
+    If the call cannot cross a process boundary (non-POSIX host, or a run_job
+    that is not importable by name) the pre-#7295 in-process path is used.
     """
     try:
         import cron.scheduler as _cs
@@ -682,15 +710,56 @@ def install_cron_scheduler_profile_isolation() -> None:
         return
 
     def _webui_profile_isolated_run_job(job, *args, **kwargs):
-        # Manual WebUI runs already enter cron_profile_context_for_home before
-        # calling run_job. Avoid nesting the non-reentrant env lock or changing
-        # the explicitly selected manual execution profile.
-        if _cron_profile_context_depth() > 0:
+        from api import cron_child
+
+        if cron_child.in_cron_job_child():
+            # Already inside a profile-pinned child: run the body here.
             return original(job, *args, **kwargs)
+        nested = _cron_profile_context_depth() > 0
+        outer = getattr(_tls, 'cron_active_context', None) if nested else None
         try:
-            with cron_profile_context_for_home(_home_for_scheduled_cron_job(job)):
-                return original(job, *args, **kwargs)
-        finally:
+            if nested and outer is None:
+                raise cron_child.ChildBoundaryUnavailable(
+                    "nested cron context has no suspendable owner on this thread")
+            home = outer.home if nested else _home_for_scheduled_cron_job(job)
+            child = cron_child.JobChild(
+                original, job, home, args, kwargs,
+                timeout=cron_child.job_timeout_seconds(job),
+            )
+            child.start()
+        except cron_child.ChildBoundaryUnavailable as exc:
+            logger.warning(
+                "Cron job %s: profile-pinned child unavailable (%s); running in-process",
+                (job or {}).get('id', '?'), exc,
+            )
+            return _finish_scheduled_run(
+                job, nested,
+                lambda: _run_job_in_process_legacy(original, job, args, kwargs, nested),
+            )
+
+        if not nested:
+            return _finish_scheduled_run(
+                job, nested,
+                lambda: child.wait(on_progress=_touch_execution_progress_in_parent),
+            )
+
+        with _suspended_cron_profile_context() as run_in_outer_context:
+            return child.wait(
+                on_progress=lambda execution_id: run_in_outer_context(
+                    lambda: _touch_execution_progress_in_parent(execution_id)
+                ),
+            )
+
+    _webui_profile_isolated_run_job._webui_profile_isolated = True
+    _webui_profile_isolated_run_job._webui_original_run_job = original
+    _cs.run_job = _webui_profile_isolated_run_job
+
+
+def _finish_scheduled_run(job, nested: bool, run):
+    try:
+        return run()
+    finally:
+        if not nested:
             event_profile = str((job or {}).get("profile") or "").strip() or None
             if _is_isolated_profile_mode():
                 event_profile = _isolated_profile_name()
@@ -701,12 +770,149 @@ def install_cron_scheduler_profile_isolation() -> None:
                 # with the historical one-argument shape.
                 publish_session_list_changed("cron_complete")
 
-    _webui_profile_isolated_run_job._webui_profile_isolated = True
-    _webui_profile_isolated_run_job._webui_original_run_job = original
-    _cs.run_job = _webui_profile_isolated_run_job
+
+@contextmanager
+def _suspended_cron_profile_context():
+    """Fully leave this thread's active cron context while it only waits.
+
+    Restores every process-global the context pinned, then releases
+    ``_cron_env_lock``; nothing runs on this thread meanwhile except the wait
+    loop.  On the way out the lock is re-acquired and the context re-applied
+    (re-snapshotting the globals it will restore on exit) so the caller's
+    remaining work runs under the same profile as before.  The yielded helper
+    runs a short callable back under the outer context.
+    """
+    ctx = getattr(_tls, 'cron_active_context', None)
+    depth = _cron_profile_context_depth()
+    if ctx is None or depth <= 0:
+        raise RuntimeError("no active cron profile context to suspend on this thread")
+
+    def _suspend():
+        try:
+            ctx._restore_globals()
+        finally:
+            _tls.cron_active_context = None
+            _tls.cron_profile_depth = 0
+            _cron_env_lock.release()
+
+    def _resume():
+        _cron_env_lock.acquire()
+        _tls.cron_profile_depth = depth
+        _tls.cron_active_context = ctx
+        ctx._apply_globals()
+
+    def _run_in_outer_context(fn):
+        _resume()
+        try:
+            return fn()
+        finally:
+            _suspend()
+
+    _suspend()
+    try:
+        yield _run_in_outer_context
+    finally:
+        _resume()
 
 
-class cron_profile_context_for_home:
+class _CronHomePin:
+    """Shared HERMES_HOME + cron module-constant pinning for cron contexts.
+
+    ``cron.jobs`` snapshots its path constants at import time, and
+    ``cron.scheduler`` keeps ``_hermes_home``/lock paths as module globals, so
+    the environment variable alone is not enough for callers that read the
+    module constants directly.  ``_apply_globals`` snapshots and pins them;
+    ``_restore_globals`` puts the snapshot back.  Both run only while this
+    thread holds ``_cron_env_lock``.
+    """
+
+    home: Path
+
+    def _resolve_home(self) -> Path:
+        raise NotImplementedError
+
+    def _apply_globals(self) -> None:
+        home = self.home
+        self._prev_env = os.environ.get('HERMES_HOME')
+        self._prev_cj = None
+        self._prev_cs = None
+        os.environ['HERMES_HOME'] = str(home)
+        try:
+            import cron.jobs as _cj
+            self._prev_cj = (_cj.HERMES_DIR, _cj.CRON_DIR, _cj.JOBS_FILE, _cj.OUTPUT_DIR)
+            _cj.HERMES_DIR = home
+            _cj.CRON_DIR = home / 'cron'
+            _cj.JOBS_FILE = _cj.CRON_DIR / 'jobs.json'
+            _cj.OUTPUT_DIR = _cj.CRON_DIR / 'output'
+        except (ImportError, AttributeError):
+            logger.debug("cron profile context: cron.jobs unavailable; env-var only")
+        # cron.scheduler snapshots _hermes_home at import time and run_job()
+        # reads config/.env from that module global. Patch it alongside
+        # cron.jobs so runs actually execute under the selected profile, not
+        # merely write output metadata there (#617).
+        try:
+            import cron.scheduler as _cs
+            self._prev_cs = (
+                getattr(_cs, '_hermes_home', None),
+                getattr(_cs, '_LOCK_DIR', None),
+                getattr(_cs, '_LOCK_FILE', None),
+            )
+            _cs._hermes_home = home
+            _cs._LOCK_DIR = home / 'cron'
+            _cs._LOCK_FILE = _cs._LOCK_DIR / '.tick.lock'
+        except (ImportError, AttributeError):
+            logger.debug("cron profile context: cron.scheduler unavailable; env-var only")
+
+    def _restore_globals(self) -> None:
+        if self._prev_env is None:
+            os.environ.pop('HERMES_HOME', None)
+        else:
+            os.environ['HERMES_HOME'] = self._prev_env
+        if self._prev_cj is not None:
+            try:
+                import cron.jobs as _cj
+                _cj.HERMES_DIR, _cj.CRON_DIR, _cj.JOBS_FILE, _cj.OUTPUT_DIR = self._prev_cj
+            except (ImportError, AttributeError):
+                pass
+        if getattr(self, '_prev_cs', None) is not None:
+            try:
+                import cron.scheduler as _cs
+                _cs._hermes_home, _cs._LOCK_DIR, _cs._LOCK_FILE = self._prev_cs
+            except (ImportError, AttributeError):
+                pass
+
+    def __enter__(self):
+        _cron_env_lock.acquire()
+        _push_cron_profile_context_depth()
+        try:
+            self._prev_env = os.environ.get('HERMES_HOME')
+            self._prev_cj = None
+            self._prev_cs = None
+            self.home = self._resolve_home()
+            self._apply_globals()
+            _tls.cron_active_context = self
+        except Exception:
+            try:
+                self._restore_globals()
+            except Exception:
+                logger.debug("cron profile context: restore after failed enter failed", exc_info=True)
+            _pop_cron_profile_context_depth()
+            _cron_env_lock.release()
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            self._restore_globals()
+        finally:
+            if getattr(_tls, 'cron_active_context', None) is self:
+                _tls.cron_active_context = None
+            _pop_cron_profile_context_depth()
+            _cron_env_lock.release()
+        return False
+
+
+class cron_profile_context_for_home(_CronHomePin):
     """Context manager that pins HERMES_HOME to an explicit profile home path.
 
     Use this variant from worker threads that don't have TLS context (e.g. the
@@ -717,74 +923,11 @@ class cron_profile_context_for_home:
     def __init__(self, home: Path):
         self._home = Path(home)
 
-    def __enter__(self):
-        _cron_env_lock.acquire()
-        _push_cron_profile_context_depth()
-        try:
-            self._prev_env = os.environ.get('HERMES_HOME')
-            os.environ['HERMES_HOME'] = str(self._home)
-
-            # Re-patch cron.jobs module-level constants (see main context manager
-            # below for the rationale).
-            self._prev_cj = None
-            try:
-                import cron.jobs as _cj
-                self._prev_cj = (_cj.HERMES_DIR, _cj.CRON_DIR, _cj.JOBS_FILE, _cj.OUTPUT_DIR)
-                _cj.HERMES_DIR = self._home
-                _cj.CRON_DIR = self._home / 'cron'
-                _cj.JOBS_FILE = _cj.CRON_DIR / 'jobs.json'
-                _cj.OUTPUT_DIR = _cj.CRON_DIR / 'output'
-            except (ImportError, AttributeError):
-                logger.debug("cron_profile_context_for_home: cron.jobs unavailable")
-
-            # cron.scheduler snapshots _hermes_home at import time and run_job()
-            # reads config/.env from that module global. Patch it alongside
-            # cron.jobs so manual WebUI runs actually execute under the selected
-            # profile, not merely write output metadata there (#617).
-            self._prev_cs = None
-            try:
-                import cron.scheduler as _cs
-                self._prev_cs = (
-                    getattr(_cs, '_hermes_home', None),
-                    getattr(_cs, '_LOCK_DIR', None),
-                    getattr(_cs, '_LOCK_FILE', None),
-                )
-                _cs._hermes_home = self._home
-                _cs._LOCK_DIR = self._home / 'cron'
-                _cs._LOCK_FILE = _cs._LOCK_DIR / '.tick.lock'
-            except (ImportError, AttributeError):
-                logger.debug("cron_profile_context_for_home: cron.scheduler unavailable")
-        except Exception:
-            _pop_cron_profile_context_depth()
-            _cron_env_lock.release()
-            raise
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        try:
-            if self._prev_env is None:
-                os.environ.pop('HERMES_HOME', None)
-            else:
-                os.environ['HERMES_HOME'] = self._prev_env
-            if self._prev_cj is not None:
-                try:
-                    import cron.jobs as _cj
-                    _cj.HERMES_DIR, _cj.CRON_DIR, _cj.JOBS_FILE, _cj.OUTPUT_DIR = self._prev_cj
-                except (ImportError, AttributeError):
-                    pass
-            if getattr(self, '_prev_cs', None) is not None:
-                try:
-                    import cron.scheduler as _cs
-                    _cs._hermes_home, _cs._LOCK_DIR, _cs._LOCK_FILE = self._prev_cs
-                except (ImportError, AttributeError):
-                    pass
-        finally:
-            _pop_cron_profile_context_depth()
-            _cron_env_lock.release()
-        return False
+    def _resolve_home(self) -> Path:
+        return self._home
 
 
-class cron_profile_context:
+class cron_profile_context(_CronHomePin):
     """Context manager that pins HERMES_HOME to the TLS-active profile.
 
     Usage:
@@ -796,73 +939,8 @@ class cron_profile_context:
     serialization cost is negligible compared to correctness).
     """
 
-    def __enter__(self):
-        _cron_env_lock.acquire()
-        _push_cron_profile_context_depth()
-        try:
-            self._prev_env = os.environ.get('HERMES_HOME')
-            home = get_active_hermes_home()
-            os.environ['HERMES_HOME'] = str(home)
-
-            # Re-patch cron.jobs module-level constants. They are snapshot at
-            # import time (line 68-71 of cron/jobs.py) and don't participate in
-            # the module's __getattr__ lazy path, so env-var alone is not enough
-            # for callers that reference the module constants directly.
-            self._prev_cj = None
-            try:
-                import cron.jobs as _cj
-                self._prev_cj = (_cj.HERMES_DIR, _cj.CRON_DIR, _cj.JOBS_FILE, _cj.OUTPUT_DIR)
-                _cj.HERMES_DIR = home
-                _cj.CRON_DIR = home / 'cron'
-                _cj.JOBS_FILE = _cj.CRON_DIR / 'jobs.json'
-                _cj.OUTPUT_DIR = _cj.CRON_DIR / 'output'
-            except (ImportError, AttributeError):
-                logger.debug("cron_profile_context: cron.jobs unavailable; env-var only")
-
-            self._prev_cs = None
-            try:
-                import cron.scheduler as _cs
-                self._prev_cs = (
-                    getattr(_cs, '_hermes_home', None),
-                    getattr(_cs, '_LOCK_DIR', None),
-                    getattr(_cs, '_LOCK_FILE', None),
-                )
-                _cs._hermes_home = home
-                _cs._LOCK_DIR = home / 'cron'
-                _cs._LOCK_FILE = _cs._LOCK_DIR / '.tick.lock'
-            except (ImportError, AttributeError):
-                logger.debug("cron_profile_context: cron.scheduler unavailable; env-var only")
-        except Exception:
-            _pop_cron_profile_context_depth()
-            _cron_env_lock.release()
-            raise
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        try:
-            # Restore env var
-            if self._prev_env is None:
-                os.environ.pop('HERMES_HOME', None)
-            else:
-                os.environ['HERMES_HOME'] = self._prev_env
-
-            # Restore cron.jobs module constants
-            if self._prev_cj is not None:
-                try:
-                    import cron.jobs as _cj
-                    _cj.HERMES_DIR, _cj.CRON_DIR, _cj.JOBS_FILE, _cj.OUTPUT_DIR = self._prev_cj
-                except (ImportError, AttributeError):
-                    pass
-            if getattr(self, '_prev_cs', None) is not None:
-                try:
-                    import cron.scheduler as _cs
-                    _cs._hermes_home, _cs._LOCK_DIR, _cs._LOCK_FILE = self._prev_cs
-                except (ImportError, AttributeError):
-                    pass
-        finally:
-            _pop_cron_profile_context_depth()
-            _cron_env_lock.release()
-        return False
+    def _resolve_home(self) -> Path:
+        return Path(get_active_hermes_home())
 
 
 def get_hermes_home_for_profile(name: str) -> Path:

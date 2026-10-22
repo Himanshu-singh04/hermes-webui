@@ -2135,6 +2135,11 @@ def _event_profile_for_cron_job(job: dict) -> str | None:
 
 def _cron_job_subprocess_main(job, execution_profile_home, result_queue):
     """Run one cron job inside a child process pinned to a profile home."""
+    # This interpreter is already the profile-pinned child: the run_job
+    # wrapper must execute the body here instead of spawning another child.
+    from api.cron_child import mark_cron_job_child
+
+    mark_cron_job_child()
     try:
         def _run():
             from cron.scheduler import run_job
