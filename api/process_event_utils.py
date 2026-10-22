@@ -108,7 +108,6 @@ def process_session_immutable_owner(proc_session: Any) -> str:
 
 
 PARKED_OWNERLESS_COMPLETIONS_MAX = 200
-_PARKED_OWNERLESS_COMMAND_PREVIEW_CHARS = 200
 # Liveness pings carry no deliverable content; they are dropped, not parked.
 _UNPARKED_OWNERLESS_EVENT_TYPES = frozenset({"heartbeat"})
 _PARKED_OWNERLESS_LOCK = threading.Lock()
@@ -147,7 +146,8 @@ def park_ownerless_completion(
         record = _PARKED_OWNERLESS.get(key)
         first = record is None
         if first:
-            command = evt.get("command")
+            # Deliberately NO command text: a command line can embed secrets,
+            # and the notice only needs to identify the withheld completion.
             record = {
                 "id": key,
                 "delivery_id": delivery_id,
@@ -160,8 +160,6 @@ def park_ownerless_completion(
                 "first_parked_at": now,
                 "count": 0,
             }
-            if isinstance(command, str) and command:
-                record["command_preview"] = command[:_PARKED_OWNERLESS_COMMAND_PREVIEW_CHARS]
             for field in ("exit_code", "completion_reason", "pattern"):
                 value = evt.get(field)
                 if isinstance(value, (str, int, float)) and not isinstance(value, bool):

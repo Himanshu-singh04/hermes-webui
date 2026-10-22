@@ -569,3 +569,250 @@ def test_parked_completions_api_lists_and_dismisses():
     routes._handle_parked_completions_dismiss(handler, {"all": True})
     assert handler.status == 200
     assert _parked() == []
+
+
+
+# ---------------------------------------------------------------------------
+# Parked-completion endpoints: profile isolation (Codex r1 CORE finding)
+#
+# The parking store is process-global and spans every profile. When auth is
+# enabled only a verified, UNBOUND full-access session may read or mutate it;
+# a profile-bound (trusted-header group map) or unresolved session gets 403.
+# ---------------------------------------------------------------------------
+
+_TRUSTED_ENV_KEYS = (
+    "HERMES_WEBUI_TRUSTED_AUTH_HEADER",
+    "HERMES_WEBUI_TRUSTED_GROUPS_HEADER",
+    "HERMES_WEBUI_GROUP_PROFILE_MAP",
+    "HERMES_WEBUI_TRUSTED_PROXY_CIDRS",
+    "HERMES_WEBUI_TRUSTED_AUTH_LOGOUT_URL",
+)
+
+
+@pytest.fixture
+def _isolated_auth(monkeypatch, tmp_path):
+    import api.auth as auth
+    import api.profiles as profiles
+
+    for key in _TRUSTED_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(auth, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(auth, "_SESSIONS_FILE", tmp_path / ".sessions.json")
+    monkeypatch.setattr(auth, "is_password_auth_enabled", lambda: False)
+    monkeypatch.setattr(auth, "are_passkeys_enabled", lambda: False)
+    monkeypatch.setattr(auth, "is_oidc_auth_enabled", lambda: False)
+    auth._sessions.clear()
+    auth._TRUSTED_AUTH_WARNINGS_EMITTED.clear()
+    profiles.clear_request_profile()
+    yield auth
+    auth._sessions.clear()
+    auth._TRUSTED_AUTH_WARNINGS_EMITTED.clear()
+    profiles.clear_request_profile()
+
+
+class _AuthHandler:
+    def __init__(self, path, *, method="GET", headers=None):
+        import io as _io
+
+        self.path = path
+        self.command = method
+        self.headers = {"Host": "localhost", "Content-Length": "0",
+                        "Content-Type": "application/json"}
+        self.headers.update(headers or {})
+        self.rfile = _io.BytesIO(b"")
+        self.wfile = _io.BytesIO()
+        self.client_address = ("127.0.0.1", 12345)
+        self.request = types.SimpleNamespace()
+        self.status = None
+
+    def send_response(self, status):
+        self.status = status
+
+    def send_header(self, key, value):
+        pass
+
+    def end_headers(self):
+        pass
+
+    def text(self):
+        return self.wfile.getvalue().decode("utf-8")
+
+
+def _park_foreign_record():
+    return _peu().park_ownerless_completion(
+        _completion(process_id="proc_foreign_blue",
+                    command="printf blue-confidential-command"),
+        addressed_session_id="blue-private-session",
+        consumer="test",
+    )
+
+
+def _drive(handler, monkeypatch, body=None):
+    """Run the real auth gate, then the real router (CSRF stubbed)."""
+    from urllib.parse import urlparse
+
+    import api.auth as auth
+    import api.routes as routes
+
+    parsed = urlparse(handler.path)
+    if not auth.check_auth(handler, parsed):
+        return False
+    if handler.command == "POST":
+        monkeypatch.setattr(routes, "_check_csrf", lambda _h: True)
+        monkeypatch.setattr(routes, "read_body", lambda _h: dict(body or {}))
+        routes.handle_post(handler, parsed)
+    else:
+        routes.handle_get(handler, parsed)
+    return True
+
+
+def _trusted_bound(monkeypatch):
+    monkeypatch.setenv("HERMES_WEBUI_TRUSTED_AUTH_HEADER", "Remote-User")
+    monkeypatch.setenv("HERMES_WEBUI_TRUSTED_GROUPS_HEADER", "Remote-Groups")
+    monkeypatch.setenv("HERMES_WEBUI_GROUP_PROFILE_MAP", '{"red-group": "red"}')
+    return {"Remote-User": "bob", "Remote-Groups": "red-group"}
+
+
+def _assert_foreign_record_hidden(handler):
+    text = handler.text()
+    assert handler.status == 403, (handler.status, text)
+    assert "blue-confidential-command" not in text
+    assert "blue-private-session" not in text
+    assert "proc_foreign_blue" not in text
+
+
+def test_parked_completions_get_rejects_profile_bound_session(monkeypatch, _isolated_auth):
+    auth = _isolated_auth
+    headers = _trusted_bound(monkeypatch)
+    _park_foreign_record()
+
+    handler = _AuthHandler("/api/background/parked-completions", headers=headers)
+    assert _drive(handler, monkeypatch) is True, "auth gate itself must admit bob"
+    info = auth.get_session_info(handler._trusted_auth_session_cookie_value)
+    assert info["bound_profile"] == "red"
+    _assert_foreign_record_hidden(handler)
+    assert len(_parked()) == 1
+
+
+@pytest.mark.parametrize("body", [{"all": True}, {"ids": ["completion:proc_foreign_blue"]}])
+def test_parked_completions_dismiss_rejects_profile_bound_session(monkeypatch, _isolated_auth, body):
+    headers = _trusted_bound(monkeypatch)
+    rec = _park_foreign_record()
+    assert rec["id"] == "completion:proc_foreign_blue"
+
+    handler = _AuthHandler("/api/background/parked-completions/dismiss",
+                           method="POST", headers=headers)
+    assert _drive(handler, monkeypatch, body) is True
+    _assert_foreign_record_hidden(handler)
+    assert [p["id"] for p in _parked()] == [rec["id"]], "record must survive"
+
+
+def test_parked_completions_reject_trusted_session_bound_to_default(monkeypatch, _isolated_auth):
+    """A group map with no matching group binds the session to 'default'."""
+    headers = _trusted_bound(monkeypatch)
+    headers["Remote-Groups"] = "unmapped-group"
+    rec = _park_foreign_record()
+
+    get = _AuthHandler("/api/background/parked-completions", headers=headers)
+    assert _drive(get, monkeypatch) is True
+    _assert_foreign_record_hidden(get)
+
+    post = _AuthHandler("/api/background/parked-completions/dismiss",
+                        method="POST", headers=headers)
+    assert _drive(post, monkeypatch, {"all": True}) is True
+    _assert_foreign_record_hidden(post)
+    assert [p["id"] for p in _parked()] == [rec["id"]]
+
+
+def test_parked_completions_reject_unresolved_session_when_auth_enabled(monkeypatch, _isolated_auth):
+    """Defense in depth: a handler reached without a verified session is refused."""
+    import api.routes as routes
+    from urllib.parse import urlparse
+
+    monkeypatch.setattr(_isolated_auth, "is_password_auth_enabled", lambda: True)
+    rec = _park_foreign_record()
+
+    for cookie in (None, "deadbeef.forged-signature"):
+        headers = {"Cookie": f"hermes_session={cookie}"} if cookie else {}
+        get = _AuthHandler("/api/background/parked-completions", headers=headers)
+        routes.handle_get(get, urlparse(get.path))
+        _assert_foreign_record_hidden(get)
+
+        for body in ({"all": True}, {"ids": [rec["id"]]}):
+            post = _AuthHandler("/api/background/parked-completions/dismiss",
+                                method="POST", headers=headers)
+            routes._handle_parked_completions_dismiss(post, body)
+            _assert_foreign_record_hidden(post)
+    assert [p["id"] for p in _parked()] == [rec["id"]]
+
+
+def test_parked_completions_allow_unbound_password_session(monkeypatch, _isolated_auth):
+    import json as _json
+
+    auth = _isolated_auth
+    monkeypatch.setattr(auth, "is_password_auth_enabled", lambda: True)
+    cookie = auth.create_session()
+    headers = {"Cookie": f"hermes_session={cookie}"}
+    rec = _park_foreign_record()
+    _peu().park_ownerless_completion(
+        _completion(process_id="proc_other"), addressed_session_id=SESS_B, consumer="test"
+    )
+
+    get = _AuthHandler("/api/background/parked-completions", headers=headers)
+    assert _drive(get, monkeypatch) is True
+    assert get.status == 200, get.text()
+    ids = [p["id"] for p in _json.loads(get.text())["parked"]]
+    assert ids == ["completion:proc_other", rec["id"]]
+
+    post = _AuthHandler("/api/background/parked-completions/dismiss",
+                        method="POST", headers=headers)
+    assert _drive(post, monkeypatch, {"ids": [rec["id"]]}) is True
+    assert post.status == 200, post.text()
+    assert _json.loads(post.text())["dismissed"] == 1
+
+    post = _AuthHandler("/api/background/parked-completions/dismiss",
+                        method="POST", headers=headers)
+    assert _drive(post, monkeypatch, {"all": True}) is True
+    assert post.status == 200, post.text()
+    assert _parked() == []
+
+
+def test_parked_completions_allow_unbound_trusted_session(monkeypatch, _isolated_auth):
+    """Trusted-header auth WITHOUT a group map yields an unbound session."""
+    monkeypatch.setenv("HERMES_WEBUI_TRUSTED_AUTH_HEADER", "Remote-User")
+    headers = {"Remote-User": "admin"}
+    _park_foreign_record()
+
+    get = _AuthHandler("/api/background/parked-completions", headers=headers)
+    assert _drive(get, monkeypatch) is True
+    assert get.status == 200, get.text()
+
+    post = _AuthHandler("/api/background/parked-completions/dismiss",
+                        method="POST", headers=headers)
+    assert _drive(post, monkeypatch, {"all": True}) is True
+    assert post.status == 200, post.text()
+    assert _parked() == []
+
+
+def test_parked_completions_allow_auth_disabled_local_mode(monkeypatch, _isolated_auth):
+    import api.routes as routes
+    from urllib.parse import urlparse
+
+    assert _isolated_auth.is_auth_enabled() is False
+    rec = _park_foreign_record()
+    get = _AuthHandler("/api/background/parked-completions")
+    routes.handle_get(get, urlparse(get.path))
+    assert get.status == 200, get.text()
+
+    post = _AuthHandler("/api/background/parked-completions/dismiss", method="POST")
+    routes._handle_parked_completions_dismiss(post, {"ids": [rec["id"]]})
+    assert post.status == 200, post.text()
+    assert _parked() == []
+
+
+def test_parked_record_omits_command_text():
+    """Smallest safe payload: no command text (it can embed secrets)."""
+    rec = _park_foreign_record()
+    for snapshot in (rec, *_parked()):
+        assert "command_preview" not in snapshot
+        assert "blue-confidential-command" not in repr(snapshot)
