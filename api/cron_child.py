@@ -24,8 +24,15 @@ Transport (POSIX only; other platforms fall back to the legacy in-process path):
 * a private result pipe carries ``("progress", execution_id)`` relays and the
   final ``("ok", result, job)`` / ``("error", ...)`` frame;
 * a private control pipe carries cancellation (one byte) and, by EOF, parent
-  death: the child kills its process group when the parent goes away, so a
+  death: the child kills its process tree when the parent goes away, so a
   WebUI crash or restart ends the job body exactly as an in-process run would.
+
+Every forced stop (cancel grace, timeout backstop, parent death, a child still
+running long after its result) kills the whole process TREE, not just the
+child's group: the Agent starts cron scripts with ``start_new_session=True``, so
+they live outside the child's process group.  Descendants are found through
+``/proc`` (or psutil where installed), frozen, then killed while the child is
+still alive to anchor them.
 
 What crosses the boundary (and what deliberately does not):
 
@@ -362,6 +369,99 @@ def _interpreter_flags() -> list[str]:
         return []
 
 
+# ── process-tree kill ───────────────────────────────────────────────────────
+_TREE_SCAN_ROUNDS = 8
+
+
+def _process_table():
+    """``{pid: (ppid, start_token)}`` for visible processes, or None if unavailable.
+
+    Linux reads ``/proc`` (no dependency); elsewhere psutil is used when it is
+    installed.  Without either only process-group signalling remains.
+    """
+    if os.path.exists("/proc/self/stat"):
+        table = {}
+        try:
+            names = os.listdir("/proc")
+        except OSError:
+            return None
+        for name in names:
+            if not name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{name}/stat", "rb") as fh:
+                    fields = fh.read().rsplit(b")", 1)[1].split()
+                # fields[1] = ppid (stat field 4); fields[19] = starttime (field 22)
+                table[int(name)] = (int(fields[1]), fields[19])
+            except (OSError, IndexError, ValueError):
+                continue
+        return table
+    try:
+        import psutil  # optional
+    except ImportError:
+        return None
+    table = {}
+    try:
+        for proc in psutil.process_iter(["pid", "ppid", "create_time"]):
+            info = proc.info
+            table[info["pid"]] = (info["ppid"], info["create_time"])
+    except Exception:
+        return None
+    return table
+
+
+def _descendants(root: int, table: dict) -> list:
+    children = {}
+    for pid, (ppid, _start) in table.items():
+        children.setdefault(ppid, []).append(pid)
+    found, stack = [], [root]
+    while stack:
+        for pid in children.get(stack.pop(), ()):
+            if pid != root and pid not in found:
+                found.append(pid)
+                stack.append(pid)
+    return found
+
+
+def kill_process_tree(root: int) -> int:
+    """SIGKILL every descendant of *root* (not *root* itself), across sessions.
+
+    Descendants are frozen with SIGSTOP and the tree is rescanned until no new
+    pid appears, so a concurrent fork cannot escape a stale snapshot; each is
+    then killed if it is still the same process (start time).  Call it while
+    *root* is alive: once *root* exits its children are re-parented and can no
+    longer be told apart from unrelated processes.  Returns the number killed.
+    """
+    frozen = {}
+    for _round in range(_TREE_SCAN_ROUNDS):
+        table = _process_table()
+        if table is None:
+            break
+        fresh = [pid for pid in _descendants(root, table)
+                 if pid not in frozen and pid != os.getpid()]
+        if not fresh:
+            break
+        for pid in fresh:
+            frozen[pid] = table[pid][1]
+            try:
+                os.kill(pid, signal.SIGSTOP)
+            except (ProcessLookupError, PermissionError):
+                pass
+    if not frozen:
+        return 0
+    current = _process_table()
+    killed = 0
+    for pid, start in frozen.items():
+        if current is not None and current.get(pid, (None, None))[1] != start:
+            continue  # exited (or the pid was recycled) since it was frozen
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed += 1
+        except (ProcessLookupError, PermissionError):
+            pass
+    return killed
+
+
 _BOOTSTRAP = (
     "import pickle, sys\n"
     "sys.path[:] = pickle.load(sys.stdin.buffer)\n"
@@ -566,11 +666,33 @@ class JobChild:
         except OSError:
             logger.debug("cron child killpg(%s) failed", sig, exc_info=True)
 
+    def _signal_leader(self, sig) -> None:
+        if self.process is None or self._leader_reaped():
+            return
+        try:
+            os.kill(self.process.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def _kill_descendant_tree(self) -> None:
+        """Kill descendants in OTHER sessions/groups (Agent cron scripts) too.
+
+        Only meaningful while the leader is still running: its exit re-parents
+        them out of reach.
+        """
+        if self.process is None or self._leader_reaped() or self._wait_leader_exit(0):
+            return
+        try:
+            kill_process_tree(self.process.pid)
+        except Exception:
+            logger.debug("cron child tree kill failed", exc_info=True)
+
     def _sweep_group_and_reap(self) -> None:
-        """SIGKILL whatever is left in the group (descendants included), then reap."""
+        """SIGKILL the descendant tree and whatever is left in the group, then reap."""
         process = self.process
         if process is None:
             return
+        self._kill_descendant_tree()
         self._signal_group(signal.SIGKILL)
         try:
             process.wait(timeout=CHILD_TERMINATE_GRACE_SECONDS)
@@ -581,9 +703,17 @@ class JobChild:
         if self.process is None:
             return
         if not self._wait_leader_exit(0):
-            self._signal_group(signal.SIGTERM)
+            # Freeze the leader so it cannot spawn past the tree snapshot, kill
+            # its whole descendant tree while it still anchors it, then let it
+            # handle SIGTERM.
+            self._signal_leader(signal.SIGSTOP)
+            try:
+                self._kill_descendant_tree()
+                self._signal_group(signal.SIGTERM)
+            finally:
+                self._signal_leader(signal.SIGCONT)
             self._wait_leader_exit(CHILD_TERMINATE_GRACE_SECONDS)
-        # Always sweep the group: descendants may outlive the leader.
+        # Always sweep: descendants may outlive the leader.
         self._sweep_group_and_reap()
 
     def _close(self) -> None:
@@ -681,9 +811,12 @@ class _ChildChannel:
                 view = view[written:]
 
 
-def _kill_own_group_and_exit(code: int = 1) -> None:  # pragma: no cover - exits
+def _kill_own_tree_and_exit(code: int = 1) -> None:  # pragma: no cover - exits
     try:
-        os.killpg(0, signal.SIGKILL)
+        try:
+            kill_process_tree(os.getpid())
+        finally:
+            os.killpg(0, signal.SIGKILL)
     finally:
         os._exit(code)
 
@@ -698,7 +831,7 @@ def _watch_control_pipe(fd: int, cancel_event: threading.Event) -> None:
         except OSError:
             data = b""
         if not data:
-            _kill_own_group_and_exit(1)
+            _kill_own_tree_and_exit(1)
             return
         cancel_event.set()
 

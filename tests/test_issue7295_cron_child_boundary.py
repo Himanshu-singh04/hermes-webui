@@ -74,6 +74,13 @@ FAKE_SOURCE = textwrap.dedent(
             grandchild = subprocess.Popen(
                 [sys.executable, "-c", "import time; time.sleep(120)"])
             info["grandchild_pid"] = grandchild.pid
+        if job.get("session_grandchild"):
+            # The Agent starts cron scripts this way (cron/scheduler_script.py):
+            # a new session, outside the child's process group.
+            session_child = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(120)"],
+                start_new_session=True)
+            info["session_grandchild_pid"] = session_child.pid
         if mode == "progress":
             try:
                 import cron.executions as executions
@@ -406,7 +413,8 @@ def test_unresponsive_child_and_descendants_are_killed_after_cancel_grace(harnes
 
     monkeypatch.setattr(cron_child, "CHILD_CANCEL_GRACE_SECONDS", 0.5)
     monkeypatch.setattr(cron_child, "CHILD_TERMINATE_GRACE_SECONDS", 1.0)
-    job, ctl = harness.job("stubborn", mode="ignore_cancel", profile="research", max_wait=60)
+    job, ctl = harness.job("stubborn", mode="ignore_cancel", profile="research", max_wait=60,
+                           session_grandchild=True)
     cancel = threading.Event()
     thread, box = harness.run_in_thread(job, cancel_event=cancel)
     info = _wait_for(ctl / "started")
@@ -417,6 +425,8 @@ def test_unresponsive_child_and_descendants_are_killed_after_cancel_grace(harnes
     assert "cancel" in str(box["error"]).lower()
     assert _pid_gone(info["pid"]), "cron child survived cancellation"
     assert _pid_gone(info["grandchild_pid"]), "cron child's descendants survived cancellation"
+    assert _pid_gone(info["session_grandchild_pid"]), (
+        "a descendant in its own session (an Agent cron script) survived cancellation")
 
 
 def test_job_timeout_kills_child(harness, monkeypatch):
@@ -429,7 +439,8 @@ def test_job_timeout_kills_child(harness, monkeypatch):
     # cron.scheduler (~2s on a loaded host) before the body starts: leave
     # enough room for startup so the kill lands mid-body, not mid-import.
     job, ctl = harness.job(
-        "timeout", mode="ignore_cancel", profile="research", max_wait=60, timeout_seconds=12)
+        "timeout", mode="ignore_cancel", profile="research", max_wait=60, timeout_seconds=12,
+        session_grandchild=True)
     thread, box = harness.run_in_thread(job)
     info = _wait_for(ctl / "started")
     assert thread.is_alive(), "backstop fired before the job body was observed running"
@@ -439,6 +450,8 @@ def test_job_timeout_kills_child(harness, monkeypatch):
     assert "timed out" in str(box["error"]).lower() or "timeout" in str(box["error"]).lower()
     assert _pid_gone(info["pid"])
     assert _pid_gone(info["grandchild_pid"])
+    assert _pid_gone(info["session_grandchild_pid"]), (
+        "a timed-out job's script in its own session (start_new_session) kept running")
 
 
 def test_overlapping_jobs_for_two_profiles_run_concurrently(harness):
@@ -493,6 +506,8 @@ def test_cron_child_dies_with_parent(tmp_path):
         harness_proc.join(10)
         assert _pid_gone(info["pid"], timeout=15), "cron child outlived its parent"
         assert _pid_gone(info["grandchild_pid"], timeout=15)
+        assert _pid_gone(info["session_grandchild_pid"], timeout=15), (
+            "a descendant in its own session outlived the WebUI parent")
     finally:
         if harness_proc.is_alive():
             harness_proc.kill()
@@ -509,7 +524,7 @@ def _orphan_harness_main(tmp_root, ctl):  # pragma: no cover - runs in forked pr
         h = _Harness(root, mp)
         job = {
             "id": "job-orphan", "ctl": ctl, "mode": "ignore_cancel", "profile": "research",
-            "max_wait": 60, "parent_pid": os.getpid(),
+            "max_wait": 60, "parent_pid": os.getpid(), "session_grandchild": True,
         }
         h.cron_scheduler.run_job(job)
     finally:
@@ -587,6 +602,34 @@ def test_descendants_left_after_a_normal_return_are_swept(harness):
     assert result[0] is True
     assert _pid_gone(info["pid"], timeout=15)
     assert _pid_gone(info["grandchild_pid"], timeout=15), "child's leftover descendant survived"
+
+
+def test_kill_process_tree_reaches_other_sessions(tmp_path):
+    from api import cron_child
+    import subprocess as sp
+
+    if cron_child._process_table() is None:
+        pytest.skip("no process table (no /proc and no psutil)")
+    pid_file = tmp_path / "grandchild.pid"
+    code = textwrap.dedent(f"""
+        import pathlib, subprocess, sys, time
+        g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
+                             start_new_session=True)
+        pathlib.Path({str(pid_file)!r}).write_text(str(g.pid))
+        time.sleep(120)
+    """)
+    leader = sp.Popen([sys.executable, "-c", code], start_new_session=True)
+    try:
+        deadline = time.monotonic() + 30
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        grandchild = int(pid_file.read_text())
+        cron_child.kill_process_tree(leader.pid)
+        assert _pid_gone(grandchild), "descendant in another session survived the tree kill"
+        assert leader.poll() is None, "the tree kill must spare the root itself"
+    finally:
+        leader.kill()
+        leader.wait(10)
 
 
 def test_fire_context_contract_matches_installed_agent(tmp_path):
