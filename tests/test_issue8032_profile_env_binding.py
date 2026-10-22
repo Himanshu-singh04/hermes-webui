@@ -14,6 +14,7 @@ allowlisted writer / loader internal, or go through the helper.
 
 import ast
 import os
+import sys
 import threading
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
@@ -219,7 +220,57 @@ def test_r5_4_root_provider_key_removal_during_named_worker(tree, monkeypatch):
 # ── r5 #5 [SILENT] profile skill counts treated an env-disabled skill as enabled ──
 
 
-def test_r5_5_profile_skill_counts_expand_env_backed_disabled_list(tree):
+def _hermetic_skill_utils(monkeypatch):
+    """A self-contained ``agent.skill_utils`` with the real helpers' semantics.
+
+    ``_compute_profile_skills_stats`` reports ``(0, 0)`` whenever the agent
+    package is absent (#7305), and other test files leave stubs of this module
+    behind, so the count assertions below must not depend on either: install
+    the four helpers the function uses, with ``parse_config_string_list``
+    matching hermes-agent's (a bare string is one name; a ``[...]`` string is a
+    serialized list).
+    """
+    import ast
+    import types
+
+    su = types.ModuleType("agent.skill_utils")
+    su.iter_skill_index_files = lambda skills_dir, filename: sorted(Path(skills_dir).rglob(filename))
+
+    def parse_frontmatter(content):
+        if not content.startswith("---"):
+            return {}, content
+        _, block, _, rest = content.split("---", 3) if content.count("---") >= 3 else ("", "", "", content)
+        fm = {}
+        for line in block.splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                fm[k.strip()] = v.strip()
+        return fm, rest
+
+    def parse_config_string_list(value):
+        if isinstance(value, str):
+            if value.strip().startswith("["):
+                try:
+                    parsed = ast.literal_eval(value.strip())
+                except (ValueError, SyntaxError):
+                    parsed = None
+                if isinstance(parsed, list):
+                    return [str(item) for item in parsed]
+            return [value]
+        return [str(item) for item in value] if isinstance(value, (list, tuple, set, frozenset)) else []
+
+    su.parse_frontmatter = parse_frontmatter
+    su.skill_matches_platform = lambda frontmatter: True
+    su.parse_config_string_list = parse_config_string_list
+    agent_pkg = types.ModuleType("agent")
+    agent_pkg.skill_utils = su
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.skill_utils", su)
+    return su
+
+
+def test_r5_5_profile_skill_counts_expand_env_backed_disabled_list(tree, monkeypatch):
+    _hermetic_skill_utils(monkeypatch)
     skill_dir = tree.writer / "skills" / "demo"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
