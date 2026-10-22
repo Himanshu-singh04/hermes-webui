@@ -16581,6 +16581,18 @@ def handle_get(handler, parsed) -> bool:
         from api.background import get_results
         return j(handler, {"results": get_results(sid)})
 
+    if parsed.path == "/api/background/parked-completions":
+        # #6752: neutral, session-less list of background completions that
+        # were withheld because they carried no immutable owner.
+        from api.process_event_utils import (
+            PARKED_OWNERLESS_COMPLETIONS_MAX,
+            list_parked_ownerless_completions,
+        )
+        return j(handler, {
+            "parked": list_parked_ownerless_completions(),
+            "max": PARKED_OWNERLESS_COMPLETIONS_MAX,
+        })
+
     if parsed.path == "/api/sessions":
         diag = RequestDiagnostics.maybe_start("GET", parsed.path, logger=logger, print_fn=getattr(handler, '_safe_webui_print', None))
         try:
@@ -19366,6 +19378,9 @@ def handle_post(handler, parsed) -> bool:
 
     if parsed.path == "/api/background":
         return _handle_background(handler, body)
+
+    if parsed.path == "/api/background/parked-completions/dismiss":
+        return _handle_parked_completions_dismiss(handler, body)
 
     if parsed.path == "/api/goal":
         return _handle_goal_command(handler, body)
@@ -28477,6 +28492,24 @@ def start_session_turn(
             "server_turn_started fan-out failed for session %s", session_id, exc_info=True
         )
     return resp
+
+
+def _handle_parked_completions_dismiss(handler, body):
+    """Dismiss parked ownerless background completions (#6752).
+
+    Body: ``{"ids": ["<record id>", ...]}`` or ``{"all": true}``. Dismissal
+    only removes the neutral notice; it never delivers the completion.
+    """
+    from api.helpers import j
+    from api.process_event_utils import dismiss_parked_ownerless_completions
+
+    body = body if isinstance(body, dict) else {}
+    if body.get("all") is True:
+        return j(handler, {"ok": True, "dismissed": dismiss_parked_ownerless_completions(None)})
+    ids = body.get("ids")
+    if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+        return bad(handler, "ids must be a list of parked completion ids, or set all=true")
+    return j(handler, {"ok": True, "dismissed": dismiss_parked_ownerless_completions(ids)})
 
 
 def _handle_bg_task_complete_ack(handler, body):
