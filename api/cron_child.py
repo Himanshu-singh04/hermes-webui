@@ -44,12 +44,17 @@ What crosses the boundary (and what deliberately does not):
   therefore never inherits that turn's identity or approval mode.
 * The Agent's per-fire ContextVars (execution identity, secret scope, terminal
   policy, multiplex semantics) are re-installed in the child for its pinned home
-  with the Agent's own helpers -- only the ones active in the parent.  Secret
-  VALUES are never pickled: the child rebuilds the scope from the profile's own
-  sources.  If the parent has an active scope the installed Agent cannot rebuild
-  in the child, the call stays in-process (``ChildBoundaryUnavailable``) rather
-  than run a body whose unscoped secret reads would fall back to the launch
-  process environment.
+  with the Agent's own helpers -- only the ones active in the parent.  The
+  child rebuilds each scope from the profile's own sources.  If the parent has
+  an active scope the installed Agent cannot rebuild in the child, the call
+  stays in-process (``ChildBoundaryUnavailable``) rather than run a body whose
+  unscoped secret reads would fall back to the launch process environment.
+* The Agent's frozen launch environment (``tui_gateway.launch_profile_policy``,
+  the only env it trusts as the launch profile's once multi-profile hosting is
+  active) is process-local, so the parent's snapshot travels over the private
+  stdin pipe and is installed in the child before anything can capture its own
+  (live, possibly WebUI-mirrored) environment.  An unrecognised snapshot layout
+  keeps the call in-process.
 * A gateway cron owner execution bound in this process (``gateway.session_cron``)
   is not transferable, so such a call stays in-process too; otherwise the child
   would resubmit the fire to the gateway instead of running it locally.  WebUI
@@ -297,6 +302,43 @@ def _gateway_owner_bound(job, home) -> bool:
     return False
 
 
+# The Agent's frozen launch environment: once multi-profile hosting is active,
+# the launch profile's env-only credentials resolve from this snapshot, never
+# from the live os.environ (which WebUI's profile mirror can overwrite).
+_LAUNCH_ENV_MODULE = "tui_gateway.launch_profile_policy"
+_LAUNCH_ENV_ATTRS = ("_snapshot", "_lock")
+
+
+def _launch_env_snapshot():
+    """The parent's frozen launch env for the child, or None when none was captured.
+
+    A process that never imported the policy module never captured one, so the
+    child's own capture (from the same live env) decides exactly as the parent
+    would.  A loaded module whose layout is unknown means the snapshot cannot be
+    carried faithfully: keep the call in-process.
+    """
+    module = sys.modules.get(_LAUNCH_ENV_MODULE)
+    if module is None:
+        return None
+    if not all(hasattr(module, attr) for attr in _LAUNCH_ENV_ATTRS):
+        raise ChildBoundaryUnavailable(
+            "the installed Agent's launch-environment snapshot cannot be carried to a child")
+    with module._lock:
+        snapshot = module._snapshot
+        return None if snapshot is None else dict(snapshot)
+
+
+def _install_launch_env_snapshot(snapshot) -> None:
+    """Child side: adopt the parent's frozen launch env before anything captures one."""
+    if snapshot is None:
+        return
+    module = importlib.import_module(_LAUNCH_ENV_MODULE)
+    if not all(hasattr(module, attr) for attr in _LAUNCH_ENV_ATTRS):
+        raise RuntimeError("cron child cannot install the parent's launch-environment snapshot")
+    with module._lock:
+        module._snapshot = dict(snapshot)
+
+
 # Per-turn markers WebUI mirrors into the process environment while a chat turn
 # streams.  An unattended job body must not inherit them (the Agent strips the
 # same presence markers from its own restart-safe cron worker).
@@ -493,6 +535,7 @@ class JobChild:
             "kwargs": kwargs,
             "wants_cancel": self.parent_cancel is not None,
             "fire_context": _snapshot_fire_context(),
+            "launch_env": _launch_env_snapshot(),
             "routing_process_home": _routing_process_home(),
             "log_level": logging.getLogger().getEffectiveLevel(),
         }
@@ -971,6 +1014,7 @@ def _child_entry() -> None:  # pragma: no cover - runs in the child interpreter
                 format="%(asctime)s %(levelname)s [cron-child %(process)d] %(name)s: %(message)s")
         job = payload["job"]
         home = Path(payload["home"])
+        _install_launch_env_snapshot(payload.get("launch_env"))
         _pin_routing_process_home(payload.get("routing_process_home"))
         from api.profiles import cron_profile_context_for_home
 

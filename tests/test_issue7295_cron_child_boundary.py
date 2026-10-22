@@ -69,6 +69,9 @@ FAKE_SOURCE = textwrap.dedent(
             "has_defer": defer_agent_teardown is not None,
             "env": {k: os.environ.get(k) for k in job.get("env_probe", ())},
         }
+        if job.get("secret_probe"):
+            from agent.secret_scope import get_secret
+            info["secrets"] = {k: get_secret(k) for k in job["secret_probe"]}
         mode = job.get("mode", "wait")
         if mode == "ignore_cancel" or job.get("spawn_grandchild"):
             grandchild = subprocess.Popen(
@@ -604,6 +607,64 @@ def test_descendants_left_after_a_normal_return_are_swept(harness):
     assert _pid_gone(info["grandchild_pid"], timeout=15), "child's leftover descendant survived"
 
 
+def test_launch_profile_secret_scope_uses_the_parents_frozen_launch_env(harness, monkeypatch):
+    """A launch-profile fire rebuilt in the child must read the trusted launch snapshot.
+
+    Once multi-profile hosting is active the Agent resolves the launch profile's
+    env-only credentials from the env it froze at activation, never the live
+    ``os.environ`` (which WebUI's profile mirror may have overwritten with another
+    profile's value).  The child must make the same decision as the parent.
+    """
+    policy = pytest.importorskip("tui_gateway.launch_profile_policy")
+    secret_scope = pytest.importorskip("agent.secret_scope")
+    hermes_constants = pytest.importorskip("hermes_constants")
+    pytest.importorskip("cron.scheduler_provider")
+
+    name = "WT7295_LAUNCH_ONLY_SECRET"
+    monkeypatch.setenv(name, "other-profile-value")
+    snapshot = dict(os.environ)
+    snapshot[name] = "launch-value"
+    monkeypatch.setattr(policy, "_snapshot", snapshot)
+    monkeypatch.setattr(hermes_constants, "_PINNED_PROCESS_HERMES_HOME",
+                        str(harness.default_home))
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+    monkeypatch.setattr(secret_scope, "_AUTO_PINNED_HOME", None, raising=False)
+    # The harness's fake parent cron.scheduler stands in for the Agent's.
+    monkeypatch.setattr(harness.cron_scheduler, "_install_fire_secret_scope",
+                        lambda: None, raising=False)
+    monkeypatch.setattr(harness.cron_scheduler, "_reset_fire_secret_scope",
+                        lambda tokens: None, raising=False)
+
+    # Parent truth: the Agent's own launch scope for the launch home.
+    assert policy.owner_secret_scope(harness.default_home)[name] == "launch-value"
+
+    job, ctl = harness.job("launch-secret", profile="default", secret_probe=[name])
+    (ctl / "release").write_text("go")
+    token = secret_scope.set_secret_scope(
+        policy.owner_secret_scope(harness.default_home), profile_home=str(harness.default_home))
+    try:
+        result = harness.cron_scheduler.run_job(job)
+    finally:
+        secret_scope.reset_secret_scope(token)
+    info = _wait_for(ctl / "started")
+    assert result[0] is True
+    assert info["pid"] != os.getpid()
+    assert info["secrets"] == {name: "launch-value"}, (
+        "child rebuilt the launch profile's scope from the live env, not the frozen launch env")
+
+
+def test_unknown_launch_env_layout_stays_in_process(harness, monkeypatch):
+    """If the Agent's launch snapshot cannot be read, never guess in a child."""
+    fake_policy = types.ModuleType("tui_gateway.launch_profile_policy")
+    monkeypatch.setitem(sys.modules, "tui_gateway.launch_profile_policy", fake_policy)
+    job, ctl = harness.job("launch-layout", profile="research")
+    (ctl / "release").write_text("go")
+    result = harness.cron_scheduler.run_job(job)
+    info = _wait_for(ctl / "started")
+    assert info["pid"] == os.getpid(), "child ran without the parent's launch-env provenance"
+    assert result[0] is True
+
+
 def test_kill_process_tree_reaches_other_sessions(tmp_path):
     from api import cron_child
     import subprocess as sp
@@ -661,6 +722,10 @@ def test_fire_context_contract_matches_installed_agent(tmp_path):
     inspect.signature(terminal_scope.get_terminal_scope).bind()
     session_cron = importlib.import_module("gateway.session_cron")
     inspect.signature(session_cron.current_execution).bind()
+    # The frozen launch env the child adopts (cron_child._LAUNCH_ENV_*).
+    policy = importlib.import_module(cron_child._LAUNCH_ENV_MODULE)
+    assert all(hasattr(policy, attr) for attr in cron_child._LAUNCH_ENV_ATTRS)
+    inspect.signature(policy.capture_launch_env).bind()
     inspect.signature(session_cron.owner_for_home).bind(tmp_path)
 
     identity_cls = execution_identity.CronExecution
