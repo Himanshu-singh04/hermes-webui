@@ -1534,6 +1534,31 @@ function _restoreComposerDraftAfterFailedSend(draftText, filesSnapshot, sid, cle
   return restoredVisible;
 }
 
+// After a CLI-only explainer, set the composer text AND persist it as the
+// session's draft. Assigning .value alone fires no input event, so the draft
+// saved while typing ("/plan X") survived and a reload restored the slash
+// command, which only repeats the explainer (#7683 fold check). An empty value
+// clears the saved draft; _saveComposerDraftNow also cancels a pending autosave.
+function _setComposerAfterCliOnlyExplainer(value){
+  const el=$('msg');
+  if(el){
+    el.value=value;
+    if(typeof autoResize==='function')autoResize();
+  }
+  const sid=S.session&&S.session.session_id;
+  if(!sid||typeof _saveComposerDraftNow!=='function') return;
+  const files=Array.isArray(S.pendingFiles)?[...S.pendingFiles]:[];
+  const onFail=(error)=>{
+    if(typeof _handleComposerDraftPostFailure==='function') _handleComposerDraftPostFailure(error,sid,value,files);
+  };
+  try{
+    const result=_saveComposerDraftNow(sid,value,files);
+    if(result&&typeof result.catch==='function') result.catch(onFail);
+  }catch(error){
+    onFail(error);
+  }
+}
+
 async function send(){
   // Static guards expect _defaultMessageMode to stay near send() while the actual
   // read remains in the S.busy branch below.
@@ -1800,17 +1825,13 @@ async function send(){
         // round 3 + UX gate). Clearing it forced a full retype of the prompt.
         if(typeof isPromptStyleCliOnlyCommand==='function'
            && isPromptStyleCliOnlyCommand(_agentCmd.name||_parsedCmd.name)){
-          const _el=$('msg');
-          if(_el){
-            _el.value=typeof promptStyleComposerText==='function'
-              ? promptStyleComposerText(_agentCmd.name||_parsedCmd.name,text)
-              : text.replace(/^\s*\/\S+\s*/,'');
-            if(typeof autoResize==='function')autoResize();
-          }
+          _setComposerAfterCliOnlyExplainer(typeof promptStyleComposerText==='function'
+            ? promptStyleComposerText(_agentCmd.name||_parsedCmd.name,text)
+            : text.replace(/^\s*\/\S+\s*/,''));
           hideCmdDropdown();
           return;
         }
-        $('msg').value='';autoResize();hideCmdDropdown();return;
+        _setComposerAfterCliOnlyExplainer('');hideCmdDropdown();return;
       }
       // Non-dispatchable registry commands (e.g. /agents) must not leak as
       // plain text to the model. Route them through the CLI-only explainer
@@ -1839,17 +1860,13 @@ async function send(){
         // it instead of retyping (#7683 review round 3 + UX gate).
         if(typeof isPromptStyleCliOnlyCommand==='function'
            && isPromptStyleCliOnlyCommand(_agentCmd.name||_parsedCmd.name)){
-          const _el=$('msg');
-          if(_el){
-            _el.value=typeof promptStyleComposerText==='function'
-              ? promptStyleComposerText(_agentCmd.name||_parsedCmd.name,text)
-              : text.replace(/^\s*\/\S+\s*/,'');
-            if(typeof autoResize==='function')autoResize();
-          }
+          _setComposerAfterCliOnlyExplainer(typeof promptStyleComposerText==='function'
+            ? promptStyleComposerText(_agentCmd.name||_parsedCmd.name,text)
+            : text.replace(/^\s*\/\S+\s*/,''));
           hideCmdDropdown();
           return;
         }
-        $('msg').value='';autoResize();hideCmdDropdown();return;
+        _setComposerAfterCliOnlyExplainer('');hideCmdDropdown();return;
       }
       const _agentCmdName=String(_agentCmd&&_agentCmd.name||_parsedCmd&&_parsedCmd.name||'').trim().toLowerCase();
       if(_AGENT_COMMANDS_RUN_ON_WEBUI.has(_agentCmdName)){

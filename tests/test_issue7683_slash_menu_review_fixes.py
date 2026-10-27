@@ -1056,3 +1056,48 @@ def test_cli_only_explainer_labels_the_description_and_goal_hint_uses_brackets()
     assert "is only available in the Hermes CLI." in src
     assert "In the CLI: ${desc}" in src
     assert "arg:'[status|pause|resume|clear|<text>]'" in src
+
+
+_DRAFT_SPY = (
+    "globalThis.__saves = [];"
+    "globalThis.__failures = [];"
+    "_handleComposerDraftPostFailure = (e, sid, text) => { __failures.push(text); };"
+    "_saveComposerDraftNow = (sid, text, files) => {"
+    "  __saves.push({ sid, text, files: files.length });"
+    "  return __FAIL__ ? Promise.reject(new Error('post failed')) : Promise.resolve();"
+    "};"
+)
+
+
+def _send_with_draft_spy(command, *, fail=False):
+    body = _DRAFT_SPY.replace("__FAIL__", "true" if fail else "false")
+    body += "await send(); await Promise.resolve(); await Promise.resolve();"
+    body += "return { saves: __saves, failures: __failures };"
+    return _run_send(command, body)
+
+
+def test_cli_only_explainer_persists_the_composer_text_as_the_draft():
+    """#7683 fold check (Codex, Chromium): setting the composer value alone left
+    the draft saved while typing ("/plan X"), so a reload restored the slash
+    command and the next Send only repeated the explainer. The reworded text,
+    the empty composer after a bare command, and the cleared composer after a
+    non-prompt CLI-only command must all be persisted for the session."""
+    request = "the users table migration"
+    cases = {
+        f"/plan {request}": f"Without executing anything yet, write an implementation plan for: {request}",
+        "/plan": "",
+        "/agents": "",
+    }
+    for command, want in cases.items():
+        out = _send_with_draft_spy(command)
+        assert out["remainingInput"] == want, (command, out["remainingInput"])
+        saves = out["result"]["saves"]
+        assert saves and saves[-1]["sid"] == "sid-1" and saves[-1]["text"] == want, (
+            f"{command} must persist {want!r} as the session draft, got {saves!r}"
+        )
+
+
+def test_cli_only_explainer_draft_failure_goes_to_the_failure_handler():
+    out = _send_with_draft_spy("/review the error handling", fail=True)
+    want = "Review the work we just discussed, focusing on: the error handling"
+    assert out["result"]["failures"] == [want], out["result"]
