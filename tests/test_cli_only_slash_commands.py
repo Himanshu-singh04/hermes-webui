@@ -110,9 +110,9 @@ def test_frontend_can_execute_agent_commands_via_api_endpoint():
 
 def test_cli_only_response_mentions_webui_scope():
     assert "function cliOnlyCommandResponse" in COMMANDS_JS
-    # #7683 review: "isn't available in the WebUI" replaced the longer
-    # "is a Hermes CLI-only command and cannot run inside the WebUI".
-    assert "isn't available in the WebUI" in COMMANDS_JS
+    # #7683 review: "is only available in the Hermes CLI" replaced the longer
+    # "is a Hermes CLI-only command and cannot run inside the WebUI" (UX gate copy).
+    assert "is only available in the Hermes CLI" in COMMANDS_JS
     assert "cannot run inside the WebUI" not in COMMANDS_JS
 
 
@@ -366,7 +366,7 @@ def test_cli_only_response_helper_uses_canonical_command_name():
         """
     )
 
-    assert "`/browser` isn't available in the WebUI" in result["response"]
+    assert "`/browser` is only available in the Hermes CLI" in result["response"]
     assert "Attach browser tools" in result["response"]
     assert "configured server-side" in result["response"]
 

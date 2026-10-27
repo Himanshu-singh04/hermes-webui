@@ -251,7 +251,7 @@ def test_moa_reaches_native_handler_not_the_cli_only_explainer():
     )
     # It must NOT be answered with the CLI-only explainer text.
     assistant = [m for m in out["messages"] if m["role"] == "assistant"]
-    assert not any("isn't available in the WebUI" in m["content"] for m in assistant), (
+    assert not any("is only available in the Hermes CLI" in m["content"] for m in assistant), (
         f"/moa was answered by the CLI-only explainer: {assistant!r} (#7683)."
     )
     # And it must NOT be sent down the generic backend-exec transport.
@@ -274,7 +274,7 @@ def test_hidden_agents_command_still_routes_through_explainer():
         """,
     )
     assistant = [m for m in out["messages"] if m["role"] == "assistant"]
-    assert any("`/agents` isn't available in the WebUI" in m["content"] for m in assistant), (
+    assert any("`/agents` is only available in the Hermes CLI" in m["content"] for m in assistant), (
         f"/agents must be answered by the CLI-only explainer, got: {assistant!r}"
     )
     assert "/api/chat/start" not in out["apiCalls"], (
@@ -341,7 +341,7 @@ def test_helper_absent_fallback_blocks_non_dispatchable_without_throwing():
         drop_dispatch_helper=True,
     )
     assistant = [m for m in out["messages"] if m["role"] == "assistant"]
-    assert any("`/agents` isn't available in the WebUI" in m["content"] for m in assistant), (
+    assert any("`/agents` is only available in the Hermes CLI" in m["content"] for m in assistant), (
         "the helper-absent fallback must explain /agents as CLI-only, "
         f"got: {assistant!r}"
     )
@@ -979,7 +979,7 @@ def test_prompt_style_command_leaves_the_de_slashed_text_in_the_composer():
         )
         assistant = [m for m in out["messages"] if m["role"] == "assistant"]
         assert any(
-            "isn't available in the WebUI" in m["content"] for m in assistant
+            "is only available in the Hermes CLI" in m["content"] for m in assistant
         ), f"{name} must be answered by the CLI-only explainer, got {assistant!r}"
         assert out["remainingInput"] == "write a migration plan for the users table", (
             f"{name} must leave the de-slashed prompt in the composer (got "
@@ -1013,7 +1013,7 @@ def test_prompt_style_composer_restore_covers_the_no_arg_form():
     than crashing or re-triggering itself on the next Send."""
     out = _run_send("/plan", "await send(); return {};")
     assistant = [m for m in out["messages"] if m["role"] == "assistant"]
-    assert any("isn't available in the WebUI" in m["content"] for m in assistant), (
+    assert any("is only available in the Hermes CLI" in m["content"] for m in assistant), (
         f"a bare /plan must still get the explainer, got {assistant!r}"
     )
     assert out["remainingInput"] == "", (
@@ -1039,3 +1039,12 @@ def test_bg_explainer_points_at_the_webui_background_command():
         f"got: {assistant!r}"
     )
 
+
+def test_cli_only_explainer_labels_the_description_and_goal_hint_uses_brackets():
+    """UX gate (#7683 f1): the explainer says where the command does work and labels the
+    registry description, so it does not read as a stray sentence; every builtin hint uses
+    <required> / [optional] notation, including /goal's free-text argument."""
+    src = (REPO_ROOT / "static" / "commands.js").read_text(encoding="utf-8")
+    assert "is only available in the Hermes CLI." in src
+    assert "In the CLI: ${desc}" in src
+    assert "arg:'[status|pause|resume|clear|<text>]'" in src

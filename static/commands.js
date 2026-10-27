@@ -26,7 +26,7 @@ const COMMANDS=[
   {name:'skills',    desc:t('cmd_skills'),   fn:cmdSkills,   arg:'[query]'},
   {name:'use',       desc:t('cmd_use'),      fn:cmdUse,      arg:'<skill-name>', subArgs:'skills', noEcho:true},
   {name:'stop',      desc:t('cmd_stop'),     fn:cmdStop,      noEcho:true},
-  {name:'goal',      desc:t('cmd_goal'),     fn:cmdGoal,      arg:'[status|pause|resume|clear|text]', subArgs:['status','pause','resume','clear']},
+  {name:'goal',      desc:t('cmd_goal'),     fn:cmdGoal,      arg:'[status|pause|resume|clear|<text>]', subArgs:['status','pause','resume','clear']},
   {name:'queue',     desc:t('cmd_queue'),    fn:cmdQueue,     arg:'<message>', noEcho:true},
   {name:'interrupt', desc:t('cmd_interrupt'), fn:cmdInterrupt, arg:'<message>', noEcho:true},
   {name:'steer',     desc:t('cmd_steer'),    fn:cmdSteer,     arg:'<message>', noEcho:true},
@@ -539,7 +539,7 @@ const PROMPT_STYLE_CLI_ONLY_COMMANDS=new Set(['plan','review','learn']);
 function cliOnlyCommandResponse(cmdName, meta){
   const name=String((meta&&meta.name)||cmdName||'').trim();
   const desc=String((meta&&meta.description)||'').trim();
-  const detail=desc?`\n\n${desc}`:'';
+  const detail=desc?`\n\nIn the CLI: ${desc}`:'';
   let extra='';
   if(PROMPT_STYLE_CLI_ONLY_COMMANDS.has(name)){
     extra='\n\nYour request is in the composer without the slash. Press Send to ask the agent directly.';
@@ -550,7 +550,7 @@ function cliOnlyCommandResponse(cmdName, meta){
   if(name==='browser'){
     extra='\n\nBrowser tools in WebUI must be configured server-side with the agent/browser environment. Once configured, ask the model to use browser tools directly; `/browser` itself only works in `hermes chat`.';
   }
-  return `\`/${name}\` isn't available in the WebUI.${detail}${extra}`;
+  return `\`/${name}\` is only available in the Hermes CLI.${detail}${extra}`;
 }
 
 // True when a CLI-only explainer tells the user their de-slashed text is
