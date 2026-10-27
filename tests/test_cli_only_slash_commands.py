@@ -122,7 +122,7 @@ def test_prompt_style_cli_only_response_points_at_a_bare_prompt():
     intent, and to send it (#7683 review round 3 + UX gate)."""
     assert "const PROMPT_STYLE_CLI_ONLY_COMMANDS=new Set(['plan','review','learn']);" in COMMANDS_JS
     response_idx = COMMANDS_JS.find("function cliOnlyCommandResponse")
-    response = COMMANDS_JS[response_idx : response_idx + 1200]
+    response = COMMANDS_JS[response_idx : COMMANDS_JS.index("\n}\n", response_idx)]
     assert "PROMPT_STYLE_CLI_ONLY_COMMANDS.has(name)" in response
     # The old wording ("Send it without the slash...") read as an
     # instruction to retype the whole prompt, and following it literally
@@ -135,7 +135,7 @@ def test_prompt_style_cli_only_response_points_at_a_bare_prompt():
 
 def test_browser_cli_only_response_explains_server_side_browser_tools():
     response_idx = COMMANDS_JS.find("function cliOnlyCommandResponse")
-    response = COMMANDS_JS[response_idx : response_idx + 900]
+    response = COMMANDS_JS[response_idx : COMMANDS_JS.index("\n}\n", response_idx)]
     assert "if(name==='browser')" in response
     assert "configured server-side" in response
     assert "`/browser` itself only works in `hermes chat`" in response
