@@ -1817,7 +1817,7 @@ async function send(){
       if(_agentCmd&&_agentCmd.cli_only){
         if(!S.session){await newSession(false,{pickerClaimEpoch:_sendProjectPickerClaim});}
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
-        S.messages.push({role:'assistant',content:cliOnlyCommandResponse(_parsedCmd.name,_agentCmd),_ts:Date.now()/1000});
+        S.messages.push({role:'assistant',content:cliOnlyCommandResponse(_parsedCmd.name,_agentCmd,_parsedCmd.args),_ts:Date.now()/1000});
         renderMessages();
         // Prompt-style commands (plan/review/learn) tell the user their
         // request is already in the composer, so leave it there, reworded to
@@ -1853,7 +1853,7 @@ async function send(){
       )){
         if(!S.session){await newSession(false,{pickerClaimEpoch:_sendProjectPickerClaim});}
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
-        S.messages.push({role:'assistant',content:cliOnlyCommandResponse(_parsedCmd.name,_agentCmd),_ts:Date.now()/1000});
+        S.messages.push({role:'assistant',content:cliOnlyCommandResponse(_parsedCmd.name,_agentCmd,_parsedCmd.args),_ts:Date.now()/1000});
         renderMessages();
         // Prompt-style commands (plan/review/learn) keep the request in the
         // composer, reworded to keep the command's intent, so the user sends

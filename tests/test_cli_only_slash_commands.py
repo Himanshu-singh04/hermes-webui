@@ -621,7 +621,7 @@ def test_send_intercepts_cli_only_commands_before_agent_round_trip():
 
     assert "await getAgentCommandMetadata(_parsedCmd.name)" in intercept
     assert "if(_agentCmd&&_agentCmd.cli_only)" in intercept
-    assert "cliOnlyCommandResponse(_parsedCmd.name,_agentCmd)" in intercept
+    assert "cliOnlyCommandResponse(_parsedCmd.name,_agentCmd,_parsedCmd.args)" in intercept
     assert "return;" in intercept
 
 

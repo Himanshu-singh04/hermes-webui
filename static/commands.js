@@ -536,13 +536,20 @@ async function getAgentCommandMetadata(name){
 // review). Extend the set when another prompt-style command joins the registry.
 const PROMPT_STYLE_CLI_ONLY_COMMANDS=new Set(['plan','review','learn']);
 
-function cliOnlyCommandResponse(cmdName, meta){
+function cliOnlyCommandResponse(cmdName, meta, args){
   const name=String((meta&&meta.name)||cmdName||'').trim();
   const desc=String((meta&&meta.description)||'').trim();
   const detail=desc?`\n\nIn the CLI: ${desc}`:'';
   let extra='';
   if(PROMPT_STYLE_CLI_ONLY_COMMANDS.has(name)){
-    extra='\n\nYour request is in the composer, reworded as a normal message. Edit it if needed, then send it.';
+    // A bare command leaves the composer empty (promptStyleComposerText), so
+    // only claim a reworded request when there was one; otherwise show how to
+    // ask for the same thing as a normal message (#7683 UX gate r3).
+    const hasRequest=args===undefined||String(args).trim()!=='';
+    const tpl=PROMPT_STYLE_COMPOSER_TEMPLATES[name];
+    extra=hasRequest||!tpl
+      ?'\n\nYour request is in the composer, reworded as a normal message. Edit it if needed, then send it.'
+      :`\n\nAsk for it as a normal message, for example: "${tpl(PROMPT_STYLE_EXAMPLE_REQUESTS[name])}"`;
   }
   if(name==='bg'){
     extra='\n\nWebUI has the same thing: `/background` runs a prompt in a background session.';
@@ -569,6 +576,11 @@ const PROMPT_STYLE_COMPOSER_TEMPLATES={
   plan:(req)=>`Without executing anything yet, write an implementation plan for: ${req}`,
   review:(req)=>`Review the work we just discussed, focusing on: ${req}`,
   learn:(req)=>`Learn a reusable skill from: ${req}`,
+};
+const PROMPT_STYLE_EXAMPLE_REQUESTS={
+  plan:'your task',
+  review:'what to check',
+  learn:'a folder, URL or notes',
 };
 function promptStyleComposerText(name, text){
   const req=String(text||'').replace(/^\s*\/\S+\s*/,'');

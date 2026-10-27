@@ -1031,6 +1031,28 @@ def test_prompt_style_composer_restore_covers_the_no_arg_form():
     )
 
 
+def test_bare_prompt_style_command_does_not_claim_text_in_the_composer():
+    """UX gate (#7683 r3): picking /plan from the dropdown inserts '/plan ' and
+    a second Enter sends it bare. The composer is then empty, so the explainer
+    must not say the request is in it; it shows a normal-message example built
+    from the same rewording instead. With a request, the composer line stays."""
+    examples = {
+        "/plan": '"Without executing anything yet, write an implementation plan for: your task"',
+        "/review": '"Review the work we just discussed, focusing on: what to check"',
+        "/learn": '"Learn a reusable skill from: a folder, URL or notes"',
+    }
+    for name, example in examples.items():
+        out = _run_send(name + " ", "await send(); return {};")
+        text = "\n".join(m["content"] for m in out["messages"] if m["role"] == "assistant")
+        assert "Your request is in the composer" not in text, (name, text)
+        assert "Ask for it as a normal message, for example: " + example in text, (name, text)
+        assert out["remainingInput"] == "", (name, out["remainingInput"])
+    out = _run_send("/plan add a retry wrapper", "await send(); return {};")
+    text = "\n".join(m["content"] for m in out["messages"] if m["role"] == "assistant")
+    assert "Your request is in the composer, reworded as a normal message." in text
+    assert "Ask for it as a normal message" not in text
+
+
 # ── Round-3 finding 3 (SHOULD-FIX): /bg points at the WebUI /background ─────
 
 
