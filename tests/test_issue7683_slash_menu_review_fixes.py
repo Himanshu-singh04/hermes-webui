@@ -972,26 +972,31 @@ def test_prompt_style_command_leaves_the_de_slashed_text_in_the_composer():
     full retype, because send() cleared the composer before the user could
     read the message.  Keeping the text means one keypress (Send) instead.
     """
-    for name in ("/plan", "/review", "/learn"):
-        out = _run_send(
-            f"{name} write a migration plan for the users table",
-            "await send(); return {};",
-        )
+    # UX gate (#7683 f2): the request is reworded so it keeps the command's
+    # intent. "/plan X" left as bare "X" asked the agent to DO X (approvals
+    # skipped in YOLO mode) instead of planning it.
+    request = "the users table migration"
+    expected = {
+        "/plan": f"Without executing anything yet, write an implementation plan for: {request}",
+        "/review": f"Review the work we just discussed, focusing on: {request}",
+        "/learn": f"Learn a reusable skill from: {request}",
+    }
+    for name, want in expected.items():
+        out = _run_send(f"{name} {request}", "await send(); return {};")
         assistant = [m for m in out["messages"] if m["role"] == "assistant"]
         assert any(
             "is only available in the Hermes CLI" in m["content"] for m in assistant
         ), f"{name} must be answered by the CLI-only explainer, got {assistant!r}"
-        assert out["remainingInput"] == "write a migration plan for the users table", (
-            f"{name} must leave the de-slashed prompt in the composer (got "
-            f"{out['remainingInput']!r}) -- clearing it forces the user to "
-            f"retype the whole prompt."
+        assert out["remainingInput"] == want, (
+            f"{name} must leave the reworded request in the composer (got "
+            f"{out['remainingInput']!r}) -- clearing it forces a retype, and the "
+            f"bare text loses what the command meant."
         )
 
 
 def test_prompt_style_explainer_wording_points_at_the_composer():
-    """#7683 review round 3 (SHOULD-FIX): the third line must tell the user
-    their text is ALREADY in the composer, so pressing Send asks the agent
-    directly.  The old wording ("Send it without the slash") reads as an
+    """#7683 review round 3 (SHOULD-FIX) + UX gate: the third line must tell
+    the user their request is ALREADY in the composer, reworded, and to send it.  The old wording ("Send it without the slash") reads as an
     instruction to retype, and following it literally produced
     "plan write a migration plan…".
     """
@@ -1001,8 +1006,11 @@ def test_prompt_style_explainer_wording_points_at_the_composer():
     assert "composer" in text, (
         f"the explainer must mention the composer, got: {assistant!r}"
     )
-    assert "Press Send" in text, (
-        f"the explainer must tell the user to press Send, got: {assistant!r}"
+    assert "reworded as a normal message" in text and "then send it" in text, (
+        f"the explainer must say the request was reworded and to send it, got: {assistant!r}"
+    )
+    assert "Press Send" not in text, (
+        "the send control is an unlabelled arrow and desktop users press Enter"
     )
 
 

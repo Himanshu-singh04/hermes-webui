@@ -542,7 +542,7 @@ function cliOnlyCommandResponse(cmdName, meta){
   const detail=desc?`\n\nIn the CLI: ${desc}`:'';
   let extra='';
   if(PROMPT_STYLE_CLI_ONLY_COMMANDS.has(name)){
-    extra='\n\nYour request is in the composer without the slash. Press Send to ask the agent directly.';
+    extra='\n\nYour request is in the composer, reworded as a normal message. Edit it if needed, then send it.';
   }
   if(name==='bg'){
     extra='\n\nWebUI has the same thing: `/background` runs a prompt in a background session.';
@@ -558,6 +558,23 @@ function cliOnlyCommandResponse(cmdName, meta){
 // text in that case so the user presses Send instead of retyping.
 function isPromptStyleCliOnlyCommand(name){
   return PROMPT_STYLE_CLI_ONLY_COMMANDS.has(String(name||'').trim());
+}
+
+// What send() leaves in the composer for a prompt-style command. Dropping only
+// the slash loses the command's intent: "/plan X" means plan X without
+// executing it, but "X" alone asks the agent to do X (with approvals skipped
+// in YOLO mode). Reword the request so it keeps what the CLI command means.
+// A bare command has no request to keep, so the composer is left empty.
+const PROMPT_STYLE_COMPOSER_TEMPLATES={
+  plan:(req)=>`Without executing anything yet, write an implementation plan for: ${req}`,
+  review:(req)=>`Review the work we just discussed, focusing on: ${req}`,
+  learn:(req)=>`Learn a reusable skill from: ${req}`,
+};
+function promptStyleComposerText(name, text){
+  const req=String(text||'').replace(/^\s*\/\S+\s*/,'');
+  if(!req.trim()) return '';
+  const tpl=PROMPT_STYLE_COMPOSER_TEMPLATES[String(name||'').trim()];
+  return tpl?tpl(req):req;
 }
 
 async function executeAgentCommand(text,_meta){
